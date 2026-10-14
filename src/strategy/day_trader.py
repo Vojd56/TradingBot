@@ -138,6 +138,8 @@ class DayTraderEngine:
         take_profit_pct: float = 2.2,     # +2.2 % rychlý skalp zisku
         stop_loss_pct: float = 1.2,       # -1.2 % těsný stop loss
         breakeven_trigger_pct: float = 1.0, # Při +1.0 % zisku posun stop-lossu na nákup
+        max_daily_loss_eur: float = 750.0,  # Maximální povolená denní ztráta (Circuit Breaker)
+        max_consecutive_losses: int = 3,   # Stop po 3 ztrátách v řadě (ochrana před nepříznivým trhem)
         sentiment_engine: Optional[SentimentEngine] = None,
         dry_run: bool = False,
     ):
@@ -154,12 +156,19 @@ class DayTraderEngine:
         self.take_profit_pct = take_profit_pct
         self.stop_loss_pct = stop_loss_pct
         self.breakeven_trigger_pct = breakeven_trigger_pct
+        self.max_daily_loss_eur = max_daily_loss_eur
+        self.max_consecutive_losses = max_consecutive_losses
 
-        # Sledování stavu obchodu
+        # Sledování stavu obchodu a statistik seance (inspirováno DavidTech / Kevin Davey pravidly)
         self._peak_prices: Dict[str, float] = {}
         self._breakeven_applied: Set[str] = set()
         self._dry_run_positions: Dict[str, PositionRecord] = {}
         self._last_discovery_ts: float = 0.0
+        self._daily_realized_pnl_eur: float = 0.0
+        self._consecutive_losses: int = 0
+        self._circuit_breaker_triggered: bool = False
+        self._session_trades_count: int = 0
+        self._session_wins: int = 0
 
     @staticmethod
     def get_ticker_currency(ticker: str) -> str:
@@ -341,6 +350,11 @@ class DayTraderEngine:
                     message=f"Bleskový Day Trade Take Profit zasažen (+{pnl_pct:.2f} %)"
                 )
                 res = self.executor.execute_sell(ticker, exit_sig, pos.quantity)
+                trade_pnl_eur = pos.allocated_eur * (pnl_pct / 100.0)
+                self._daily_realized_pnl_eur += trade_pnl_eur
+                self._consecutive_losses = 0
+                self._session_trades_count += 1
+                self._session_wins += 1
                 closed_reports.append({"ticker": ticker, "reason": "TAKE_PROFIT", "pnl_pct": pnl_pct, "res": res})
                 self._peak_prices.pop(ticker, None)
                 self._breakeven_applied.discard(ticker)
@@ -361,6 +375,21 @@ class DayTraderEngine:
                     message=f"Day Trade Stop Loss aktivován k ochraně kapitálu ({pnl_pct:.2f} %)"
                 )
                 res = self.executor.execute_sell(ticker, exit_sig, pos.quantity)
+                trade_pnl_eur = pos.allocated_eur * (pnl_pct / 100.0)
+                self._daily_realized_pnl_eur += trade_pnl_eur
+                self._consecutive_losses += 1
+                self._session_trades_count += 1
+
+                # Kontrola limitů Circuit Breakeru
+                if self._consecutive_losses >= self.max_consecutive_losses or self._daily_realized_pnl_eur <= -self.max_daily_loss_eur:
+                    self._circuit_breaker_triggered = True
+                    cb_msg = (
+                        f"🛑 [CIRCUIT BREAKER AKTIVOVÁN] Dosažen limit denní ztráty ({self._daily_realized_pnl_eur:.2f} EUR) "
+                        f"nebo {self._consecutive_losses} ztrát v řadě! Nové nákupy pro dnešek pozastaveny pro ochranu kapitálu."
+                    )
+                    logger.warning(cb_msg)
+                    print(f"\n{cb_msg}\n")
+
                 closed_reports.append({"ticker": ticker, "reason": "STOP_LOSS", "pnl_pct": pnl_pct, "res": res})
                 self._peak_prices.pop(ticker, None)
                 self._breakeven_applied.discard(ticker)
@@ -373,6 +402,11 @@ class DayTraderEngine:
     def execute_daytrade_buys(self, signals: List[DayTradeSignal]) -> List[Dict[str, Any]]:
         """Vybere nejlepší BUY signály a bleskově otevře pozice až do limitu."""
         opened_reports: List[Dict[str, Any]] = []
+
+        if self._circuit_breaker_triggered:
+            logger.info("Circuit Breaker je aktivní: nové nákupy jsou pro dnešek zablokovány.")
+            return opened_reports
+
         open_positions = self.get_all_active_positions()
         available_slots = max(0, self.max_active_positions - len(open_positions))
 
@@ -531,6 +565,7 @@ class DayTraderEngine:
         print(f"  Cílový Take Profit:   +{self.take_profit_pct:.1f} % (nebo 2x ATR)")
         print(f"  Těsný Stop Loss:      -{self.stop_loss_pct:.1f} % (nebo 1.2x ATR)")
         print(f"  Breakeven Stop:       Aktivní při zisku +{self.breakeven_trigger_pct:.1f} %")
+        print(f"  Circuit Breaker:      Stop po {self.max_consecutive_losses} ztrátách nebo -{self.max_daily_loss_eur:.0f} EUR ztráty")
         print(f"  AI Validátor (NPU):   AKTIVNÍ (Lemonade NPU provádí bleskový sanity check zpráv)")
         print(f"  Režim:                {'DRY-RUN (Simulace)' if self.dry_run else 'LIVE EXEKUCE (Demo účet)'}")
         print("=" * 70 + "\n")
@@ -559,6 +594,10 @@ class DayTraderEngine:
                     mode_label = "🟡 SIMULACE (--dry-run: příkazy se na burzu neposílají)" if self.dry_run else "🟢 LIVE EXEKUCE (Reálný demo účet Trading 212)"
                     print(f"Režim:                   {mode_label}")
                     print(f"Sledováno v reálném čase: {len(self.watchlist)} titulů (Páková ETF, Tech lídři, Nové zprávy)")
+                    win_pct = (self._session_wins / self._session_trades_count * 100.0) if self._session_trades_count > 0 else 0.0
+                    pnl_sign = "+" if self._daily_realized_pnl_eur >= 0 else ""
+                    cb_status = " 🛑 (CIRCUIT BREAKER AKTIVNÍ)" if self._circuit_breaker_triggered else " 🟢 (Aktivní)"
+                    print(f"Denní PnL seance:        {pnl_sign}{self._daily_realized_pnl_eur:.2f} EUR | Obchody: {self._session_trades_count} (Win: {self._session_wins}, Win Rate: {win_pct:.0f} %){cb_status}")
                     open_pos = self.get_all_active_positions()
                     if open_pos:
                         print(f"Otevřené pozice ({len(open_pos)} / {self.max_active_positions}):")

@@ -25,6 +25,8 @@ test.py.txt
 data.py.txt
 dict
 list
+scratch/
+transcript*
 
 # Editor directories
 .vscode/
