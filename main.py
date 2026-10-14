@@ -364,7 +364,21 @@ class TradingBotApp:
         print(f"=== ZASEDÁNÍ RADY AI ANALYTIKŮ PRO TITUL: {clean} ===\n")
         stock_data = self.data_provider.prepare_ticker_data(clean)
         if not stock_data:
-            print(f"Nepodařilo se načíst tržní data pro {clean}.")
+            import yfinance as yf
+            try:
+                search_results = yf.Search(clean).quotes
+                alts = [
+                    f"{q['symbol']} ({q.get('longname') or q.get('shortname') or q.get('symbol')})"
+                    for q in search_results if q.get("symbol") != clean
+                ]
+                if alts:
+                    print(f"💡 Ticker '{clean}' nebyl na americkém trhu nalezen. Možná jste mysleli:")
+                    for a in alts[:4]:
+                        print(f"   • {a}")
+                    print("\nTip: Evropské akcie vyžadují příponu burzy (např. .AS pro Amsterdam, .PR pro Prahu, .DE pro Frankfurt).")
+            except Exception:
+                pass
+            print(f"Nepodařilo se načíst tržní data pro {clean}.\n")
             return
 
         consensus = self.committee.evaluate_consensus(stock_data)
