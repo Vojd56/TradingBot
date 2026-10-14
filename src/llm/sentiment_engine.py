@@ -403,3 +403,75 @@ Povolené hodnoty pro recommendation jsou výhradně: "BUY", "HOLD", "AVOID". Na
             risks=["Nedostupnost nebo nevalidní odpověď analytického LLM modulu."],
             reasoning=f"Automatický fallback pro {stock_data.ticker} z důvodu nedostupnosti LLM výstupu.",
         )
+
+    def fast_daytrade_check(
+        self,
+        ticker: str,
+        current_price: float,
+        technical_score: float,
+        headlines: List[str],
+        timeout_seconds: float = 4.0,
+    ) -> Dict[str, Any]:
+        """
+        Bleskový AI sanity check pro Day Trader těsně před nákupem:
+        - Zkontroluje čerstvé zprávy na přítomnost bezprostřední katastrofy, žaloby, účetního skandálu nebo krachu.
+        - Zajišťuje, aby technické momentum nebylo 'pastí' před pádem.
+        - Vygeneruje rychlé rozhodnutí: approved (True/False), sentiment (-1.0 až +1.0), důvod.
+        - Využívá krátký timeout (default 4 s), aby nikdy nebrzdil intradenní cyklus.
+        """
+        if not headlines:
+            return {
+                "approved": True,
+                "sentiment": 0.15,
+                "reason": "Žádné bezprostřední negativní zprávy.",
+                "llm_used": False,
+            }
+
+        news_summary = "\n".join([f"- {h}" for h in headlines[:3]])
+        prompt = (
+            f"Jsi bleskový AI risk manažer pro intradenní nákup akcie {ticker} (cena: {current_price:.2f}, technické skóre: {technical_score:.1f}/100).\n"
+            f"Čerstvé zprávy:\n{news_summary}\n\n"
+            f"Otázka: Hrozí podle těchto zpráv bezprostřední krach, vyšetřování SEC, účetní podvod nebo masivní propad?\n"
+            f"Odpověz VÝHRADNĚ validním JSON objektem v tomto přesném tvaru:\n"
+            f'{{"approved": true, "sentiment": 0.4, "reason": "Stručné shrnutí v češtině (1 věta)"}}\n'
+            f'Pokud zprávy naznačují vážné riziko krachu nebo žaloby, nastav approved na false a sentiment na zápornou hodnotu.'
+        )
+
+        try:
+            response = self.client.chat.completions.create(
+                model=self.model,
+                messages=[
+                    {
+                        "role": "system",
+                        "content": "Jsi kvantitativní AI risk analytik. Odpovídáš VÝHRADNĚ jedním validním JSON objektem.",
+                    },
+                    {"role": "user", "content": prompt},
+                ],
+                temperature=0.1,
+                max_tokens=120,
+                timeout=timeout_seconds,
+            )
+
+            raw = response.choices[0].message.content or "{}"
+            # Extrakce JSONu
+            m = re.search(r"\{.*?\}", raw, re.DOTALL)
+            if m:
+                data = json.loads(m.group(0))
+                approved = bool(data.get("approved", True))
+                sentiment = float(data.get("sentiment", 0.0))
+                reason = str(data.get("reason", "AI schválila nákup."))
+                return {
+                    "approved": approved,
+                    "sentiment": max(-1.0, min(1.0, sentiment)),
+                    "reason": reason,
+                    "llm_used": True,
+                }
+        except Exception as exc:
+            logger.debug(f"Blesková AI kontrola {ticker} nebyla dostupná přes LLM ({exc}). Pokračuji s kvantitativním schválením.")
+
+        return {
+            "approved": True,
+            "sentiment": 0.0,
+            "reason": "Kvantitativní schválení (Lemonade LLM offline nebo časový limit).",
+            "llm_used": False,
+        }

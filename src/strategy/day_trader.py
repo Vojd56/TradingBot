@@ -5,10 +5,12 @@ import time
 from typing import Any, Dict, List, Optional, Set
 from zoneinfo import ZoneInfo
 
+import yfinance as yf
 from src.broker.t212_client import Trading212Client
 from src.execution.order_executor import OrderExecutor
 from src.execution.portfolio_tracker import PortfolioTracker, PositionRecord
 from src.execution.ticker_mapper import TickerMapper
+from src.llm.sentiment_engine import SentimentEngine
 from src.strategy.autonomous_discovery import AutonomousDiscoveryEngine
 from src.strategy.intraday_data import IntradayDataProvider, IntradaySnapshot
 from src.strategy.market_hours import MarketHours
@@ -136,6 +138,7 @@ class DayTraderEngine:
         take_profit_pct: float = 2.2,     # +2.2 % rychlý skalp zisku
         stop_loss_pct: float = 1.2,       # -1.2 % těsný stop loss
         breakeven_trigger_pct: float = 1.0, # Při +1.0 % zisku posun stop-lossu na nákup
+        sentiment_engine: Optional[SentimentEngine] = None,
         dry_run: bool = False,
     ):
         self.client = client or Trading212Client()
@@ -144,6 +147,7 @@ class DayTraderEngine:
         self.executor = executor or OrderExecutor(client=self.client, tracker=self.tracker, dry_run=self.dry_run)
         self.data_provider = data_provider or IntradayDataProvider(interval="5m")
         self.discovery_engine = discovery_engine or AutonomousDiscoveryEngine()
+        self.sentiment_engine = sentiment_engine or SentimentEngine()
         self.watchlist: List[str] = list(watchlist or DEFAULT_DAYTRADE_WATCHLIST)
         self.max_active_positions = max_active_positions
         self.allocation_per_trade_eur = allocation_per_trade_eur
@@ -380,6 +384,44 @@ class DayTraderEngine:
 
         for sig in buy_signals[:available_slots]:
             curr = getattr(sig, "currency", self.get_ticker_currency(sig.ticker))
+
+            # --- 🤖 BLESKOVÝ AI RISK CHECK (AMD NPU / Lemonade Server) ---
+            headlines: List[str] = []
+            try:
+                raw_news = yf.Ticker(sig.ticker).news or []
+                for n in raw_news[:3]:
+                    t_text = n.get("title") or n.get("content", {}).get("title", "")
+                    if t_text:
+                        headlines.append(t_text.strip())
+            except Exception:
+                pass
+
+            ai_check = self.sentiment_engine.fast_daytrade_check(
+                ticker=sig.ticker,
+                current_price=sig.current_price,
+                technical_score=sig.score,
+                headlines=headlines,
+                timeout_seconds=4.0,
+            )
+
+            # Pokud AI detekuje bezprostřední nebezpečí nebo krach -> VETO
+            if not ai_check.get("approved", True):
+                veto_msg = (
+                    f"  🚫 [AI VETO - NÁKUP ZAMÍTNUT] {sig.ticker} | "
+                    f"Riziko: {ai_check.get('reason', 'Detekováno vysoké riziko')} | Nákup zrušen!"
+                )
+                logger.warning(veto_msg)
+                print(veto_msg)
+                continue
+
+            if ai_check.get("llm_used", False):
+                ai_info_msg = (
+                    f"  🤖 [AI NPU POTVRZENO] {sig.ticker} | "
+                    f"Sentiment: {ai_check['sentiment']:+.2f} | {ai_check['reason']}"
+                )
+                logger.info(ai_info_msg)
+                print(ai_info_msg)
+
             std_signal = TradingSignal(
                 ticker=sig.ticker,
                 action=SignalAction.BUY,
@@ -388,7 +430,7 @@ class DayTraderEngine:
                 stop_loss_price=sig.stop_loss_price,
                 take_profit_price=sig.take_profit_price,
                 technical_score=sig.score / 2.0,
-                sentiment_score=sig.score / 2.0,
+                sentiment_score=round(max(0.0, min(100.0, (ai_check.get("sentiment", 0.0) * 50.0 + 50.0))), 1),
                 total_score=sig.score,
                 time_horizon="INTRADAY",
                 current_price=sig.current_price,
@@ -489,6 +531,7 @@ class DayTraderEngine:
         print(f"  Cílový Take Profit:   +{self.take_profit_pct:.1f} % (nebo 2x ATR)")
         print(f"  Těsný Stop Loss:      -{self.stop_loss_pct:.1f} % (nebo 1.2x ATR)")
         print(f"  Breakeven Stop:       Aktivní při zisku +{self.breakeven_trigger_pct:.1f} %")
+        print(f"  AI Validátor (NPU):   AKTIVNÍ (Lemonade NPU provádí bleskový sanity check zpráv)")
         print(f"  Režim:                {'DRY-RUN (Simulace)' if self.dry_run else 'LIVE EXEKUCE (Demo účet)'}")
         print("=" * 70 + "\n")
         print("Stiskněte Ctrl+C pro bezpečné zastavení Day Tradera.\n")
