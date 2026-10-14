@@ -1,11 +1,20 @@
+import os
+from pathlib import Path
+import subprocess
+import sys
+
+# Automatické přepnutí na virtuální prostředí venv, pokud byl skript spuštěn globálním pythonem
+if not (hasattr(sys, "real_prefix") or (hasattr(sys, "base_prefix") and sys.base_prefix != sys.prefix)):
+    venv_py = Path(__file__).resolve().parent / "venv" / "Scripts" / "python.exe"
+    if venv_py.exists():
+        res = subprocess.run([str(venv_py), str(Path(__file__).resolve()), *sys.argv[1:]])
+        sys.exit(res.returncode)
+
 import argparse
 from datetime import datetime
 import json
 import logging
 from logging.handlers import RotatingFileHandler
-import os
-from pathlib import Path
-import sys
 import time
 from typing import Any, Dict, Optional
 import schedule
