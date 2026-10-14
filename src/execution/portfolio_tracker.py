@@ -69,6 +69,10 @@ class PortfolioTracker:
         except Exception as exc:
             logger.error(f"Chyba při ukládání stavu portfolia do {self.storage_path}: {exc}")
 
+    def save_portfolio(self) -> None:
+        """Veřejná metoda pro uložení aktuálního stavu portfolia na disk."""
+        self._save()
+
     def get_open_positions(self) -> Dict[str, PositionRecord]:
         """Vrátí všechny aktuálně otevřené pozice."""
         return {

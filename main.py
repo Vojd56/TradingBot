@@ -23,6 +23,7 @@ from src.llm.sentiment_engine import SentimentEngine
 from src.strategy import RiskManager, StockPicker
 from src.strategy.autonomous_discovery import AutonomousDiscoveryEngine
 from src.strategy.continuous_researcher import ContinuousResearcher
+from src.strategy.day_trader import DayTraderEngine
 from src.strategy.intelligence_cache import IntelligenceCache
 from src.strategy.market_hours import MarketHours
 
@@ -389,12 +390,28 @@ def main():
         help="Čas spouštění v plánovači (výchozí: 21:00 CET během otevřeného trhu, lze např. '16:30,21:00').",
     )
     parser.add_argument(
+        "--daytrade",
+        action="store_true",
+        help="Spustí agresivní Day Trading & Leveraged Momentum režim (5m svíčky, VWAP, EMA Ribbon, páková ETF).",
+    )
+    parser.add_argument(
+        "--interval",
+        type=int,
+        default=60,
+        help="Interval skenování v sekundách pro Day Trading režim (výchozí: 60 s).",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Vynutí spuštění cyklu i o víkendu při --run-once.",
     )
 
     args = parser.parse_args()
+
+    if args.daytrade:
+        daytrader = DayTraderEngine(dry_run=args.dry_run)
+        daytrader.start_loop(scan_interval_seconds=args.interval)
+        return
 
     app = TradingBotApp(dry_run=args.dry_run)
 
