@@ -19,6 +19,7 @@ from src.execution import (
     PortfolioTracker,
     TickerMapper,
 )
+from src.llm.multi_llm_committee import MultiLLMCommittee
 from src.llm.sentiment_engine import SentimentEngine
 from src.strategy import RiskManager, StockPicker
 from src.strategy.autonomous_discovery import AutonomousDiscoveryEngine
@@ -26,6 +27,7 @@ from src.strategy.continuous_researcher import ContinuousResearcher
 from src.strategy.day_trader import DayTraderEngine
 from src.strategy.intelligence_cache import IntelligenceCache
 from src.strategy.market_hours import MarketHours
+from src.strategy.scheduled_scanner import ScheduledMarketScanner
 
 # Vytvoření adresáře pro logy a reporty
 LOGS_DIR = Path("logs")
@@ -89,6 +91,14 @@ class TradingBotApp:
             dry_run=self.dry_run,
         )
         self.discovery_engine = AutonomousDiscoveryEngine(scanner=self.picker.opportunity_scanner)
+        self.committee = MultiLLMCommittee(sentiment_engine=self.sentiment_engine)
+        self.market_scanner = ScheduledMarketScanner(
+            opportunity_scanner=self.picker.opportunity_scanner,
+            data_provider=self.data_provider,
+            committee=self.committee,
+            intelligence_cache=self.intelligence_cache,
+            discovery_engine=self.discovery_engine,
+        )
         self.researcher = ContinuousResearcher(
             cache=self.intelligence_cache,
             data_provider=self.data_provider,
@@ -291,6 +301,85 @@ class TradingBotApp:
         print("\n✨ Tyto tituly byly dynamicky zařazeny do univerza bota.")
         print("NPU model a kvantitativní skener je nyní automaticky analyzují a připravují k nákupu.\n")
 
+    def scan_market_now(self, top_candidates: int = 12) -> None:
+        """Spustí okamžitý hloubkový sken globálního trhu s Multi-LLM konsenzem."""
+        self.print_banner()
+        self.market_scanner.run_deep_scan(session_label="OKAMŽITÝ SKEN", top_quant_candidates=top_candidates)
+
+    def schedule_market_scans(self) -> None:
+        """Spustí plánovač pro dvoufázové denní skenování trhu (09:30 a 16:00 CET)."""
+        self.print_banner()
+        self.market_scanner.start_scheduler_loop()
+
+    def show_scanner_status(self) -> None:
+        """Zobrazí aktuální stav a schválené příležitosti z Rady AI v databázi."""
+        self.print_banner()
+        fpath = self.market_scanner.output_file
+        if not fpath.exists():
+            print("Databáze schválených příležitostí zatím neexistuje.")
+            print("Spusťte skenování pomocí: python main.py --scan")
+            return
+
+        try:
+            with open(fpath, "r", encoding="utf-8") as f:
+                data = json.load(f)
+            opps = data.get("opportunities", [])
+            last_iso = data.get("last_scan_iso", "N/A")
+            label = data.get("session_label", "N/A")
+
+            print(f"=== SCHVÁLENÉ PŘÍLEŽITOSTI S KONSENZEM RADY AI ===")
+            print(f"Poslední sken:    {last_iso} [{label}]")
+            print(f"Schváleno titulů: {len(opps)}\n")
+
+            if not opps:
+                print("V posledním skenu nezískal žádný titul potřebný konsenzus bez výhrad.")
+                return
+
+            print(f"{'Ticker':<7} | {'Verdikt':<8} | {'Shoda':<12} | {'Sentiment':<10} | {'Jistota':<8} | {'Syntéza a odůvodnění'}")
+            print("-" * 95)
+            for o in opps:
+                dr = o.get("consolidated_catalysts", [""])[0] if o.get("consolidated_catalysts") else o.get("consensus_synthesis", "")[:40]
+                shoda_str = f"{o.get('agreement_percentage', 0):.0f} % ({o.get('consensus_strength', '')[:8]})"
+                print(
+                    f"{o.get('ticker'):<7} | {o.get('final_recommendation'):<8} | {shoda_str:<12} | "
+                    f"{o.get('average_sentiment', 0.0):+6.2f}     | {o.get('average_confidence', 0.5)*100:4.0f} %  | {dr[:40]}"
+                )
+            print("\n")
+        except Exception as exc:
+            print(f"Chyba při čtení schválených příležitostí: {exc}")
+
+    def evaluate_committee_ticker(self, ticker: str) -> None:
+        """Provede detailní oponenturu Rady AI pro jeden konkrétní titul."""
+        self.print_banner()
+        clean = ticker.strip().upper()
+        print(f"=== ZASEDÁNÍ RADY AI ANALYTIKŮ PRO TITUL: {clean} ===\n")
+        stock_data = self.data_provider.prepare_ticker_data(clean)
+        if not stock_data:
+            print(f"Nepodařilo se načíst tržní data pro {clean}.")
+            return
+
+        consensus = self.committee.evaluate_consensus(stock_data)
+
+        print(f"\nSPOLEČNOST: {clean} ({stock_data.company_name}) | Sektor: {stock_data.sector}")
+        print(f"Aktuální cena: {stock_data.metrics.current_price:.2f} | Trend: {'BÝČÍ' if stock_data.metrics.trend_bullish else 'MEDVĚDÍ'} | RSI: {stock_data.metrics.rsi_14:.1f}\n")
+
+        print("--- INDIVIDUÁLNÍ VERDIKTY RADY AI ---")
+        for role_name, v in consensus.agent_verdicts.items():
+            print(f"\n👤 [ROLE: {role_name}]")
+            print(f"   Doporučení:     {v.recommendation}")
+            print(f"   Sentiment:      {v.sentiment_score:+.2f} [-1.0 až +1.0] | Jistota: {v.confidence*100:.0f} %")
+            print(f"   Argumenty:      {', '.join(v.key_arguments) if v.key_arguments else 'N/A'}")
+            print(f"   Červené vlajky: {', '.join(v.red_flags) if v.red_flags else 'N/A'}")
+            print(f"   Odůvodnění:     {v.reasoning}")
+
+        print("\n" + "=" * 70)
+        print(f"🏛️ VÝSLEDNÝ KONSENZUS: {consensus.consensus_strength} | Shoda: {consensus.agreement_percentage:.0f} %")
+        print(f"   Finální doporučení:    {consensus.final_recommendation}")
+        print(f"   Schváleno pro trading: {'🟢 ANO' if consensus.approved_for_trading else '🔴 NE'}")
+        print(f"   Syntéza rady:          {consensus.consensus_synthesis}")
+        print(f"   Ověření pravdivosti:   {consensus.truth_verification_note}")
+        print("=" * 70 + "\n")
+
     def start_daemon(self, live_market_check_minutes: int = 15) -> None:
         """
         Spustí nepřetržitý 24/7 režim (Způsob 2):
@@ -401,6 +490,28 @@ def main():
         help="Interval skenování v sekundách pro Day Trading režim (výchozí: 60 s).",
     )
     parser.add_argument(
+        "--scan",
+        action="store_true",
+        help="Spustí okamžitý hloubkový sken globálního trhu s Radou AI (Fundament + Skeptik + Katalyzátory) a uloží schválené příležitosti.",
+    )
+    parser.add_argument(
+        "--schedule-scans",
+        action="store_true",
+        help="Spustí plánovač pro automatické dvoufázové denní skenování trhu (09:30 a 16:00 CET).",
+    )
+    parser.add_argument(
+        "--scanner-status",
+        action="store_true",
+        help="Zobrazí aktuálně schválené příležitosti s konsenzem Rady AI v databázi (data/qualified_opportunities.json).",
+    )
+    parser.add_argument(
+        "--committee",
+        type=str,
+        default=None,
+        metavar="TICKER",
+        help="Provede detailní oponenturu a ověření pravdivosti v Radě AI pro jeden konkrétní titul (např. --committee NVDA).",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Vynutí spuštění cyklu i o víkendu při --run-once.",
@@ -415,7 +526,15 @@ def main():
 
     app = TradingBotApp(dry_run=args.dry_run)
 
-    if args.status:
+    if args.scan:
+        app.scan_market_now()
+    elif args.schedule_scans:
+        app.schedule_market_scans()
+    elif args.scanner_status:
+        app.show_scanner_status()
+    elif args.committee:
+        app.evaluate_committee_ticker(args.committee)
+    elif args.status:
         app.show_status()
     elif args.research_status:
         app.show_research_status()

@@ -155,6 +155,18 @@ class DayTraderEngine:
         self.regime_detector = regime_detector or MarketRegimeDetector(sentiment_engine=self.sentiment_engine)
         self.current_regime_snapshot: Optional[RegimeSnapshot] = None
         self.watchlist: List[str] = list(watchlist or DEFAULT_DAYTRADE_WATCHLIST)
+        # Dynamické načtení ověřených příležitostí z Rady AI (ScheduledMarketScanner)
+        try:
+            from src.strategy.scheduled_scanner import ScheduledMarketScanner
+            qualified = ScheduledMarketScanner.load_qualified_tickers()
+            for q in qualified:
+                if q not in self.watchlist:
+                    self.watchlist.append(q)
+            if qualified:
+                logger.info(f"Day Trader zařadil {len(qualified)} schválených titulů z Rady AI do aktivního sledování.")
+        except Exception:
+            pass
+
         self.max_active_positions = max_active_positions
         self.allocation_per_trade_eur = allocation_per_trade_eur
         self.take_profit_pct = take_profit_pct
@@ -594,7 +606,13 @@ class DayTraderEngine:
         print("          ⚡ AI DAY TRADER & LEVERAGED MOMENTUM ENGINE ⚡       ")
         print("=" * 70)
         print(f"  Frekvence skenování:  Každých {scan_interval_seconds} sekund")
-        print(f"  Sledováno titulů:     {len(self.watchlist)} aktivních akcií & pákových ETF")
+        try:
+            from src.strategy.scheduled_scanner import ScheduledMarketScanner
+            qualified = ScheduledMarketScanner.load_qualified_tickers()
+            qual_note = f" (včetně {len(qualified)} s konsenzem Rady AI)" if qualified else ""
+        except Exception:
+            qual_note = ""
+        print(f"  Sledováno titulů:     {len(self.watchlist)} aktivních akcií & pákových ETF{qual_note}")
         print(f"  Autonomní discovery:  Každých {discovery_interval_minutes} minut hledá nové akcie z médií")
         print(f"  Alokace na obchod:    {self.allocation_per_trade_eur:,.0f} EUR")
         print(f"  Max otevřených pozic: {self.max_active_positions}")

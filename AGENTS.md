@@ -34,6 +34,17 @@ Projekt obsahuje dva hlavní obchodní módy:
 * **Role AI (AMD NPU):** Lokální model `Qwen2.5-7B-Instruct-NPU` provádí hloubkovou analýzu fundamentů (P/E, ROIC, marže, zprávy) a ukládá výsledky do `IntelligenceCache`.
 * **Kritéria:** Striktní vstup pouze při `BUY` signálu a celkovém skóre $\ge 70/100$.
 
+### C) Rozdělený Hloubkový Skener Trhu & Rada AI (2x denně)
+* **Spuštění:** `python main.py --scan` (okamžitý sken) nebo `python main.py --schedule-scans` (plánovač na 09:30 a 16:00 CET) či skript `run_market_scanner.cmd`
+* **Účel:** Odděluje strategické hledání příležitostí od samotného tradingu. 2x denně (při otevření Evropy 09:30 CET a Wall Street 16:00 CET) hloubkově projde trh a ověří příležitosti.
+* **Multi-LLM Rada modelů (Consensus Committee):**
+  - Každou akcii nezávisle hodnotí 3 specializované AI persony:
+    1. **Fundamentální analytik** (P/E, marže, ROIC, rozvaha)
+    2. **Skeptický auditor / Ďáblův advokát** (hledá skrytá rizika a bubliny; má **právo VETA**)
+    3. **Katalytický specialista** (zprávy, momentum, makro vítr)
+  - **Ověření pravdivosti & Konsenzus:** Nákup je schválen pouze při jednohlasné (`UNANIMOUS`) nebo většinové (`MAJORITY`) shodě. Pokud skeptik zjistí kritické riziko (`VETO_TRIGGERED`) nebo panuje neshoda (`SPLIT_DECISION`), obchod je zablokován pro ochranu kapitálu.
+  - Schválené příležitosti se ukládají do `data/qualified_opportunities.json`, odkud si je Day Trader bleskově načítá pro exekuci.
+
 ---
 
 ## 3. Vývojové a provozní zásady
