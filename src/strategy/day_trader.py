@@ -107,6 +107,7 @@ class DayTradeSignal:
     stop_loss_price: float
     take_profit_price: float
     reasons: List[str]
+    currency: str = "USD"
     timestamp: datetime = field(default_factory=datetime.now)
 
 
@@ -153,7 +154,27 @@ class DayTraderEngine:
         # Sledování stavu obchodu
         self._peak_prices: Dict[str, float] = {}
         self._breakeven_applied: Set[str] = set()
+        self._dry_run_positions: Dict[str, PositionRecord] = {}
         self._last_discovery_ts: float = 0.0
+
+    @staticmethod
+    def get_ticker_currency(ticker: str) -> str:
+        """Určí měnu instrumentu podle burzovní přípony."""
+        t = ticker.upper()
+        if t.endswith((".DE", ".PA", ".AS", ".MC", ".MI")):
+            return "EUR"
+        if t.endswith(".L"):
+            return "GBp"
+        if t.endswith(".SW"):
+            return "CHF"
+        return "USD"
+
+    def get_all_active_positions(self) -> Dict[str, PositionRecord]:
+        """Vrátí všechny sledované pozice (reálné z trackeru + případné simulované v dry-run)."""
+        res = dict(self.tracker.get_open_positions())
+        if self.dry_run:
+            res.update(self._dry_run_positions)
+        return res
 
     def discover_new_daytrade_tickers(self, max_new: int = 4) -> List[str]:
         """Skenuje breaking zprávy na nová technologická IPO, kontrakty a zařazuje je do watchlistu."""
@@ -235,6 +256,7 @@ class DayTraderEngine:
         tp_price = round(snap.current_price + tp_dist, 2)
 
         action = SignalAction.BUY if score >= 62.0 else SignalAction.HOLD
+        currency = self.get_ticker_currency(snap.ticker)
 
         return DayTradeSignal(
             ticker=snap.ticker,
@@ -250,6 +272,7 @@ class DayTraderEngine:
             stop_loss_price=sl_price,
             take_profit_price=tp_price,
             reasons=reasons,
+            currency=currency,
         )
 
     def audit_active_positions(self) -> List[Dict[str, Any]]:
@@ -261,9 +284,9 @@ class DayTraderEngine:
         - Trailing Stop pro běžící zisky
         """
         closed_reports: List[Dict[str, Any]] = []
-        open_positions = self.tracker.get_open_positions()
+        open_positions = self.get_all_active_positions()
 
-        for ticker, pos in open_positions.items():
+        for ticker, pos in list(open_positions.items()):
             snap = self.data_provider.fetch_intraday_snapshot(ticker)
             if not snap:
                 continue
@@ -273,6 +296,7 @@ class DayTraderEngine:
             if entry_price <= 0:
                 continue
 
+            curr = self.get_ticker_currency(ticker)
             pnl_pct = ((current_price - entry_price) / entry_price) * 100.0
 
             # Evidence nejvyšší dosažené ceny
@@ -285,20 +309,26 @@ class DayTraderEngine:
             if pnl_pct >= self.breakeven_trigger_pct and ticker not in self._breakeven_applied:
                 pos.stop_loss_price = round(entry_price * 1.001, 2)
                 self._breakeven_applied.add(ticker)
-                self.tracker.save_portfolio()
-                logger.info(f"🛡️ [BREAKEVEN AKTIVOVÁN] {ticker}: Zisk dosáhl +{pnl_pct:.2f} %. Stop Loss posunut na nákupní cenu ({pos.stop_loss_price:.2f} USD).")
+                if ticker in self.tracker.positions:
+                    self.tracker.save_portfolio()
+                logger.info(f"🛡️ [BREAKEVEN AKTIVOVÁN] {ticker}: Zisk dosáhl +{pnl_pct:.2f} %. Stop Loss posunut na nákupní cenu ({pos.stop_loss_price:.2f} {curr}).")
+                print(f"  🛡️ [BREAKEVEN POSUNUT] {ticker}: Zisk +{pnl_pct:.2f} % -> Nový SL: {pos.stop_loss_price:.2f} {curr}")
 
             # 2. Dynamický Trailing Stop pro běžící zisky
             if pnl_pct >= 2.0:
                 trailing_level = round(peak - (snap.atr_5m * 1.2), 2)
                 if trailing_level > pos.stop_loss_price:
                     pos.stop_loss_price = trailing_level
-                    self.tracker.save_portfolio()
-                    logger.info(f"📈 [TRAILING STOP POSUNUT] {ticker}: Nový Stop Loss {trailing_level:.2f} USD (High: {peak:.2f} USD).")
+                    if ticker in self.tracker.positions:
+                        self.tracker.save_portfolio()
+                    logger.info(f"📈 [TRAILING STOP POSUNUT] {ticker}: Nový Stop Loss {trailing_level:.2f} {curr} (High: {peak:.2f} {curr}).")
+                    print(f"  📈 [TRAILING STOP] {ticker}: Nový SL: {trailing_level:.2f} {curr}")
 
             # 3. Kontrola Take Profitu
             if current_price >= pos.take_profit_price:
-                logger.info(f"🎯 [TAKE PROFIT ZASAŽEN] {ticker}: Cena {current_price:.2f} >= TP {pos.take_profit_price:.2f} USD (+{pnl_pct:.2f} % zisk).")
+                msg = f"🎯 [TAKE PROFIT ZASAŽEN] {ticker}: Cena {current_price:.2f} >= TP {pos.take_profit_price:.2f} {curr} (+{pnl_pct:.2f} % zisk)!"
+                logger.info(msg)
+                print(f"  {msg}")
                 exit_sig = PositionExitSignal(
                     ticker=ticker,
                     should_exit=True,
@@ -310,11 +340,15 @@ class DayTraderEngine:
                 closed_reports.append({"ticker": ticker, "reason": "TAKE_PROFIT", "pnl_pct": pnl_pct, "res": res})
                 self._peak_prices.pop(ticker, None)
                 self._breakeven_applied.discard(ticker)
+                if ticker in self._dry_run_positions:
+                    del self._dry_run_positions[ticker]
                 continue
 
             # 4. Kontrola Stop Lossu
             if current_price <= pos.stop_loss_price:
-                logger.info(f"🛑 [STOP LOSS ZASAŽEN] {ticker}: Cena {current_price:.2f} <= SL {pos.stop_loss_price:.2f} USD ({pnl_pct:.2f} % ztráta).")
+                msg = f"🛑 [STOP LOSS ZASAŽEN] {ticker}: Cena {current_price:.2f} <= SL {pos.stop_loss_price:.2f} {curr} ({pnl_pct:.2f} % ztráta)!"
+                logger.info(msg)
+                print(f"  {msg}")
                 exit_sig = PositionExitSignal(
                     ticker=ticker,
                     should_exit=True,
@@ -326,6 +360,8 @@ class DayTraderEngine:
                 closed_reports.append({"ticker": ticker, "reason": "STOP_LOSS", "pnl_pct": pnl_pct, "res": res})
                 self._peak_prices.pop(ticker, None)
                 self._breakeven_applied.discard(ticker)
+                if ticker in self._dry_run_positions:
+                    del self._dry_run_positions[ticker]
                 continue
 
         return closed_reports
@@ -333,7 +369,7 @@ class DayTraderEngine:
     def execute_daytrade_buys(self, signals: List[DayTradeSignal]) -> List[Dict[str, Any]]:
         """Vybere nejlepší BUY signály a bleskově otevře pozice až do limitu."""
         opened_reports: List[Dict[str, Any]] = []
-        open_positions = self.tracker.get_open_positions()
+        open_positions = self.get_all_active_positions()
         available_slots = max(0, self.max_active_positions - len(open_positions))
 
         if available_slots <= 0:
@@ -343,6 +379,7 @@ class DayTraderEngine:
         buy_signals.sort(key=lambda s: s.score, reverse=True)
 
         for sig in buy_signals[:available_slots]:
+            curr = getattr(sig, "currency", self.get_ticker_currency(sig.ticker))
             std_signal = TradingSignal(
                 ticker=sig.ticker,
                 action=SignalAction.BUY,
@@ -357,17 +394,43 @@ class DayTraderEngine:
                 current_price=sig.current_price,
                 atr_14=sig.atr_5m,
                 rsi_14=sig.rsi_5m,
+                currency=curr,
             )
+
+            if self.dry_run:
+                print(
+                    f"  ⚡ [SIMULACE NÁKUPU (--dry-run)] {sig.ticker} | Skóre: {sig.score:.1f}/100 | "
+                    f"Cena: {sig.current_price:.2f} {curr} | SL: {sig.stop_loss_price:.2f} | "
+                    f"TP: {sig.take_profit_price:.2f} | Důvody: {', '.join(sig.reasons[:2])}"
+                )
+            else:
+                print(
+                    f"  🚀 [ODESÍLÁM NÁKUP T212] {sig.ticker} | Skóre: {sig.score:.1f}/100 | "
+                    f"Cena: {sig.current_price:.2f} {curr} | SL: {sig.stop_loss_price:.2f} | "
+                    f"TP: {sig.take_profit_price:.2f} | Důvody: {', '.join(sig.reasons[:2])}"
+                )
 
             logger.info(
                 f"🚀 [DAY TRADE VSTUP] {sig.ticker} | Skóre: {sig.score:.1f}/100 | "
-                f"Cena: {sig.current_price:.2f} USD | TP: {sig.take_profit_price:.2f} | "
+                f"Cena: {sig.current_price:.2f} {curr} | TP: {sig.take_profit_price:.2f} | "
                 f"SL: {sig.stop_loss_price:.2f} | Důvody: {', '.join(sig.reasons[:2])}"
             )
 
             buy_res = self.executor.execute_buy(std_signal)
             if buy_res:
                 self._peak_prices[sig.ticker] = sig.current_price
+                if self.dry_run:
+                    qty = buy_res.get("quantity", 1.0)
+                    self._dry_run_positions[sig.ticker] = PositionRecord(
+                        ticker=sig.ticker,
+                        t212_ticker=TickerMapper.to_t212_ticker(sig.ticker),
+                        quantity=qty,
+                        entry_price_usd=sig.current_price,
+                        stop_loss_price=sig.stop_loss_price,
+                        take_profit_price=sig.take_profit_price,
+                        allocated_eur=self.allocation_per_trade_eur,
+                        status="OPEN",
+                    )
                 opened_reports.append({
                     "ticker": sig.ticker,
                     "price": sig.current_price,
@@ -375,7 +438,7 @@ class DayTraderEngine:
                     "tp": sig.take_profit_price,
                     "sl": sig.stop_loss_price,
                 })
-                time.sleep(1.0)
+                time.sleep(0.5)
 
         return opened_reports
 
@@ -450,15 +513,19 @@ class DayTraderEngine:
 
                     # Tisk živého terminálového přehledu
                     print(f"\n--- [DAY TRADER STATUS {datetime.now().strftime('%H:%M:%S')}] ---")
+                    mode_label = "🟡 SIMULACE (--dry-run: příkazy se na burzu neposílají)" if self.dry_run else "🟢 LIVE EXEKUCE (Reálný demo účet Trading 212)"
+                    print(f"Režim:                   {mode_label}")
                     print(f"Sledováno v reálném čase: {len(self.watchlist)} titulů (Páková ETF, Tech lídři, Nové zprávy)")
-                    open_pos = self.tracker.get_open_positions()
+                    open_pos = self.get_all_active_positions()
                     if open_pos:
                         print(f"Otevřené pozice ({len(open_pos)} / {self.max_active_positions}):")
                         for t, p in open_pos.items():
                             peak = self._peak_prices.get(t, p.entry_price_usd)
+                            curr = self.get_ticker_currency(t)
+                            sim_badge = " [SIMULACE]" if t in self._dry_run_positions else ""
                             print(
-                                f"  • {t:<6} | Nákup: {p.entry_price_usd:.2f} | "
-                                f"SL: {p.stop_loss_price:.2f} | TP: {p.take_profit_price:.2f} | "
+                                f"  • {t:<7}{sim_badge} | Nákup: {p.entry_price_usd:7.2f} {curr} | "
+                                f"SL: {p.stop_loss_price:7.2f} | TP: {p.take_profit_price:7.2f} | "
                                 f"Alokováno: {p.allocated_eur:.0f} EUR"
                             )
                     else:
@@ -469,9 +536,10 @@ class DayTraderEngine:
                     for s in signals[:8]:
                         above_str = "NAD VWAP ▲" if (s.current_price > s.vwap) else "POD VWAP ▼"
                         action_icon = "🟢 BUY " if s.action == SignalAction.BUY else "⚪ HOLD"
+                        curr = getattr(s, "currency", self.get_ticker_currency(s.ticker))
                         print(
                             f"  {action_icon} {s.ticker:<7} | Skóre: {s.score:4.1f}/100 | "
-                            f"Cena: {s.current_price:7.2f} USD ({above_str}) | "
+                            f"Cena: {s.current_price:7.2f} {curr} ({above_str}) | "
                             f"5m RSI: {s.rsi_5m:4.1f} | Objem: {s.volume_surge:3.1f}x"
                         )
                     print(f"Příští sken za {scan_interval_seconds} sekund...\n")
