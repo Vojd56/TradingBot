@@ -105,16 +105,21 @@ class ScheduledMarketScanner:
             all_consensuses.append(consensus)
 
             # Uložení do IntelligenceCache pro zpětnou vazbu celého systému
-            v_fund = consensus.agent_verdicts.get("FUNDAMENTAL_ANALYST")
-            if v_fund:
-                self.intelligence_cache.save_verdict(
-                    ticker=ticker,
-                    verdict=v_fund.model_dump(mode="python"),  # type: ignore
-                    company_name=stock_data.company_name,
-                    sector=stock_data.sector,
-                    article_count=len(stock_data.recent_news),
-                    latest_headline=stock_data.recent_news[0].title if stock_data.recent_news else "",
-                )
+            self.intelligence_cache.save_verdict(
+                ticker=ticker,
+                verdict={
+                    "recommendation": consensus.final_recommendation,
+                    "sentiment_score": consensus.average_sentiment,
+                    "confidence": consensus.average_confidence,
+                    "key_drivers": consensus.consolidated_catalysts,
+                    "risks": consensus.consolidated_risks,
+                    "reasoning": consensus.consensus_synthesis,
+                },
+                company_name=stock_data.company_name,
+                sector=stock_data.sector,
+                article_count=len(stock_data.recent_news),
+                latest_headline=stock_data.recent_news[0].title if stock_data.recent_news else "",
+            )
 
             if consensus.approved_for_trading:
                 approved_consensuses.append(consensus)

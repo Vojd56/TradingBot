@@ -165,16 +165,32 @@ class IntelligenceCache:
         """Uloží nový hloubkový výzkum zpracovaný lokálním LLM."""
         now = datetime.now()
         clean = ticker.strip().upper()
+
+        if isinstance(verdict, dict):
+            s_score = float(verdict.get("sentiment_score", 0.0))
+            rec = str(verdict.get("recommendation", "HOLD"))
+            conf = float(verdict.get("confidence", 0.5))
+            drivers = verdict.get("key_drivers") or verdict.get("key_arguments") or []
+            risks = verdict.get("risks") or verdict.get("red_flags") or []
+            reasoning = str(verdict.get("reasoning", ""))
+        else:
+            s_score = getattr(verdict, "sentiment_score", 0.0)
+            rec = getattr(verdict, "recommendation", "HOLD")
+            conf = getattr(verdict, "confidence", 0.5)
+            drivers = getattr(verdict, "key_drivers", getattr(verdict, "key_arguments", []))
+            risks = getattr(verdict, "risks", getattr(verdict, "red_flags", []))
+            reasoning = getattr(verdict, "reasoning", "")
+
         entry = CachedIntelligence(
             ticker=clean,
             company_name=company_name or clean,
             sector=sector or "N/A",
-            sentiment_score=verdict.sentiment_score,
-            recommendation=verdict.recommendation,
-            confidence=verdict.confidence,
-            key_drivers=verdict.key_drivers,
-            risks=verdict.risks,
-            reasoning=verdict.reasoning,
+            sentiment_score=s_score,
+            recommendation=rec,
+            confidence=conf,
+            key_drivers=list(drivers),
+            risks=list(risks),
+            reasoning=reasoning,
             article_count=article_count,
             latest_headline=latest_headline,
             last_analyzed_iso=now.isoformat(),
@@ -183,8 +199,8 @@ class IntelligenceCache:
         self._entries[clean] = entry
         self.save()
         logger.info(
-            f"🧠 Uložen výzkum pro {clean}: {verdict.recommendation} | "
-            f"Sentiment: {verdict.sentiment_score:+.2f} | Článků: {article_count}"
+            f"🧠 Uložen výzkum pro {clean}: {rec} | "
+            f"Sentiment: {s_score:+.2f} | Článků: {article_count}"
         )
 
     def get_next_tickers_to_research(
