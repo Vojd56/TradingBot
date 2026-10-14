@@ -420,13 +420,28 @@ class DayTraderEngine:
         open_positions = self.get_all_active_positions()
         available_slots = max(0, self.max_active_positions - len(open_positions))
 
+        buy_signals = [s for s in signals if s.action == SignalAction.BUY and s.ticker not in open_positions]
+        tradeable_buys = [s for s in buy_signals if MarketHours.is_ticker_market_open(s.ticker)]
+        closed_market_buys = [s for s in buy_signals if not MarketHours.is_ticker_market_open(s.ticker)]
+
         if available_slots <= 0:
+            if buy_signals:
+                cand_list = ", ".join([f"{s.ticker} ({s.score:.0f})" for s in buy_signals[:3]])
+                print(
+                    f"  ⏸️ [KAPACITA PLNÁ] Nalezen BUY signál ({cand_list}), ale všechny sloty jsou obsazeny "
+                    f"({len(open_positions)}/{self.max_active_positions}). Čekám na uvolnění slotu (TP nebo SL)."
+                )
             return opened_reports
 
-        buy_signals = [s for s in signals if s.action == SignalAction.BUY and s.ticker not in open_positions]
-        buy_signals.sort(key=lambda s: s.score, reverse=True)
+        if not tradeable_buys:
+            if closed_market_buys:
+                closed_list = ", ".join([s.ticker for s in closed_market_buys[:3]])
+                print(f"  🌙 [BURZA ZAVŘENA] BUY signál pro {closed_list}, ale příslušná burza je uzavřena (např. Evropa po 17:30 CET).")
+            return opened_reports
 
-        for sig in buy_signals[:available_slots]:
+        tradeable_buys.sort(key=lambda s: s.score, reverse=True)
+
+        for sig in tradeable_buys[:available_slots]:
             curr = getattr(sig, "currency", self.get_ticker_currency(sig.ticker))
 
             # --- 🤖 BLESKOVÝ AI RISK CHECK (AMD NPU / Lemonade Server) ---
@@ -648,10 +663,12 @@ class DayTraderEngine:
                     signals.sort(key=lambda s: s.score, reverse=True)
                     for s in signals[:8]:
                         above_str = "NAD VWAP ▲" if (s.current_price > s.vwap) else "POD VWAP ▼"
+                        market_open = MarketHours.is_ticker_market_open(s.ticker)
+                        market_note = "" if market_open else " (🌙 Burza zavřena)"
                         action_icon = "🟢 BUY " if s.action == SignalAction.BUY else "⚪ HOLD"
                         curr = getattr(s, "currency", self.get_ticker_currency(s.ticker))
                         print(
-                            f"  {action_icon} {s.ticker:<7} | Skóre: {s.score:4.1f}/100 | "
+                            f"  {action_icon} {s.ticker:<7}{market_note} | Skóre: {s.score:4.1f}/100 | "
                             f"Cena: {s.current_price:7.2f} {curr} ({above_str}) | "
                             f"5m RSI: {s.rsi_5m:4.1f} | Objem: {s.volume_surge:3.1f}x"
                         )

@@ -47,6 +47,18 @@ class MarketHours:
         return cls.is_eu_market_open() or cls.is_us_market_open()
 
     @classmethod
+    def is_ticker_market_open(cls, ticker: str) -> bool:
+        """
+        Zjistí, zda je burza pro daný ticker v tuto chvíli otevřená.
+        Evropské burzy (.DE, .PA, .AS, .L, .MC, .MI, .SW): 09:00 - 17:30 CET
+        Americké burzy (NYSE, NASDAQ, ETF): 15:30 - 22:00 CET
+        """
+        upper = ticker.upper()
+        if any(upper.endswith(sfx) for sfx in [".DE", ".PA", ".AS", ".L", ".MC", ".MI", ".SW"]):
+            return cls.is_eu_market_open()
+        return cls.is_us_market_open()
+
+    @classmethod
     def get_time_until_open(cls) -> timedelta:
         """Vrátí čas zbývající do příštího otevření kteréhokoliv trhu."""
         now_local = datetime.now(LOCAL_TZ)

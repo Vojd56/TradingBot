@@ -104,7 +104,7 @@ class MarketRegimeDetector:
                 take_profit_pct=2.8,
                 stop_loss_pct=1.2,
                 breakeven_pct=1.0,
-                max_active_positions=5,
+                max_active_positions=6,
                 allow_new_buys=True,
                 reasoning=f"{reason_prefix}Nízký VIX ({vix}) a růst indexu SPY ({spy_chg:+.2f} %). Optimální býčí podmínky pro trend.",
                 llm_used=False,
@@ -117,7 +117,7 @@ class MarketRegimeDetector:
                 take_profit_pct=1.6,
                 stop_loss_pct=1.0,
                 breakeven_pct=0.7,
-                max_active_positions=3,
+                max_active_positions=5,
                 allow_new_buys=True,
                 reasoning=f"{reason_prefix}Mírná volatilita (VIX: {vix}, SPY: {spy_chg:+.2f} %). Rychlé skalpy a včasný Breakeven.",
                 llm_used=False,
@@ -169,13 +169,13 @@ class MarketRegimeDetector:
 
                 if "BULL" in reg_str or "RISK_ON" in reg_str:
                     regime = MarketRegime.RISK_ON_BULL
-                    tp, sl, be, slots, buys = 2.8, 1.2, 1.0, 5, True
+                    tp, sl, be, slots, buys = 2.8, 1.2, 1.0, 6, True
                 elif "PANIC" in reg_str or "RISK_OFF" in reg_str or vix >= 26.0:
                     regime = MarketRegime.RISK_OFF_PANIC
                     tp, sl, be, slots, buys = 1.5, 1.0, 0.7, 0, False
                 else:
                     regime = MarketRegime.NEUTRAL_CHOPPY
-                    tp, sl, be, slots, buys = 1.6, 1.0, 0.7, 3, True
+                    tp, sl, be, slots, buys = 1.6, 1.0, 0.7, 5, True
 
                 snapshot = RegimeSnapshot(
                     regime=regime,
