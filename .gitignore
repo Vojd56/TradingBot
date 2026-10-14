@@ -1,0 +1,33 @@
+# Byte-compiled / optimized / DLL files
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Virtual environments
+venv/
+env/
+.venv/
+
+# Environment variables & secrets (CRITICAL: Do NOT remove)
+.env
+
+# Logs and transient reports
+logs/
+*.log
+
+# Intelligence cache & local dynamic state
+data/
+*.sqlite
+*.db
+
+# Temporary test artifacts
+test.py.txt
+data.py.txt
+dict
+list
+
+# Editor directories
+.vscode/
+.idea/
+*.swp
+*.swo
