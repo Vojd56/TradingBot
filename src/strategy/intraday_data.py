@@ -40,19 +40,13 @@ class IntradayDataProvider:
         self.interval = interval
         self.period = period
 
-    def fetch_intraday_snapshot(self, ticker: str) -> Optional[IntradaySnapshot]:
-        """Stáhne a spočítá kompletní intradenní technický profil pro jeden ticker."""
-        clean = ticker.strip().upper()
+    def _compute_from_df(self, ticker: str, df: pd.DataFrame) -> Optional[IntradaySnapshot]:
+        """Vypočítá technický profil (VWAP, EMA 9/21, RSI, Volume Surge, ATR) z DataFrame svíček."""
+        if df.empty or len(df) < 5:
+            return None
+
         try:
-            df = yf.download(clean, period=self.period, interval=self.interval, progress=False)
-            if df.empty or len(df) < 5:
-                return None
-
-            # Zploštění multi-indexu u yfinance
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-
-            # 1. Výpočet VWAP (Volume-Weighted Average Price) z dnešních dat
+            # 1. Výpočet VWAP (Volume-Weighted Average Price)
             typical_price = (df['High'] + df['Low'] + df['Close']) / 3.0
             cum_vol = df['Volume'].cumsum()
             cum_vol_price = (typical_price * df['Volume']).cumsum()
@@ -78,13 +72,13 @@ class IntradayDataProvider:
             rsi_series = 100 - (100 / (1 + rs))
             curr_rsi = float(rsi_series.iloc[-1]) if not np.isnan(rsi_series.iloc[-1]) else 50.0
 
-            # 4. Volume Surge Ratio (aktuální svíčka vůči průměru posledních 10 svíček)
+            # 4. Volume Surge Ratio
             vol_ma = df['Volume'].rolling(window=10, min_periods=2).mean()
             curr_vol = float(df['Volume'].iloc[-1])
             avg_vol = float(vol_ma.iloc[-1]) if float(vol_ma.iloc[-1]) > 0 else 1.0
             volume_surge = round(curr_vol / avg_vol, 2)
 
-            # 5. ATR (Average True Range) na 5m svíčkách pro dynamický stop-loss
+            # 5. ATR (Average True Range) na 5m svíčkách
             tr1 = df['High'] - df['Low']
             tr2 = (df['High'] - df['Close'].shift()).abs()
             tr3 = (df['Low'] - df['Close'].shift()).abs()
@@ -92,7 +86,7 @@ class IntradayDataProvider:
             atr_series = tr.rolling(window=14, min_periods=3).mean()
             curr_atr = float(atr_series.iloc[-1]) if not np.isnan(atr_series.iloc[-1]) else float(df['Close'].iloc[-1]) * 0.01
 
-            # 6. Breakout 30minutového pásma (posledních 6 pětiminutových svíček)
+            # 6. Breakout 30minutového pásma
             last_6 = df.iloc[-6:] if len(df) >= 6 else df
             high_30m = float(last_6['High'].max())
             low_30m = float(last_6['Low'].min())
@@ -103,7 +97,7 @@ class IntradayDataProvider:
             change_pct = ((curr_close - first_open) / first_open) * 100.0
 
             return IntradaySnapshot(
-                ticker=clean,
+                ticker=ticker,
                 current_price=round(curr_close, 2),
                 vwap=round(current_vwap, 2),
                 is_above_vwap=(curr_close > current_vwap),
@@ -121,14 +115,69 @@ class IntradayDataProvider:
                 timestamp=datetime.now(),
             )
         except Exception as exc:
+            logger.debug(f"[Intraday Data] Chyba výpočtu indikátorů pro {ticker}: {exc}")
+            return None
+
+    def fetch_intraday_snapshot(self, ticker: str) -> Optional[IntradaySnapshot]:
+        """Stáhne a spočítá kompletní intradenní technický profil pro jeden ticker."""
+        clean = ticker.strip().upper()
+        try:
+            df = yf.download(clean, period=self.period, interval=self.interval, progress=False)
+            if df.empty or len(df) < 5:
+                return None
+
+            # Zploštění multi-indexu u yfinance
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+
+            return self._compute_from_df(clean, df)
+        except Exception as exc:
             logger.debug(f"[Intraday Data] Chyba při načítání 5m svíček pro {clean}: {exc}")
             return None
 
     def fetch_batch_snapshots(self, tickers: List[str]) -> Dict[str, IntradaySnapshot]:
-        """Rychlé stažení intradenních profilů pro více tickerů."""
+        """Rychlé paralelní stažení intradenních profilů pro celé široké univerzum (50-100 tickerů)."""
+        clean_tickers = [t.strip().upper() for t in tickers if t.strip()]
+        if not clean_tickers:
+            return {}
+
         results: Dict[str, IntradaySnapshot] = {}
-        for t in tickers:
-            snap = self.fetch_intraday_snapshot(t)
-            if snap:
-                results[snap.ticker] = snap
+        if len(clean_tickers) < 3:
+            for t in clean_tickers:
+                s = self.fetch_intraday_snapshot(t)
+                if s:
+                    results[s.ticker] = s
+            return results
+
+        try:
+            raw_data = yf.download(clean_tickers, period=self.period, interval=self.interval, progress=False)
+            if raw_data.empty:
+                return {}
+
+            for t in clean_tickers:
+                try:
+                    if len(clean_tickers) == 1:
+                        sub_df = raw_data
+                    else:
+                        sub_df = pd.DataFrame({
+                            'Open': raw_data['Open'][t],
+                            'High': raw_data['High'][t],
+                            'Low': raw_data['Low'][t],
+                            'Close': raw_data['Close'][t],
+                            'Volume': raw_data['Volume'][t],
+                        }).dropna()
+
+                    snap = self._compute_from_df(t, sub_df)
+                    if snap:
+                        results[snap.ticker] = snap
+                except Exception as sub_exc:
+                    logger.debug(f"Chyba při zpracování batch tickeru {t}: {sub_exc}")
+
+        except Exception as exc:
+            logger.warning(f"Batch stahování intradenních dat selhalo ({exc}), fallback na sekvenční.")
+            for t in clean_tickers:
+                s = self.fetch_intraday_snapshot(t)
+                if s:
+                    results[s.ticker] = s
+
         return results

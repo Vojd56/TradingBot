@@ -9,30 +9,85 @@ from src.broker.t212_client import Trading212Client
 from src.execution.order_executor import OrderExecutor
 from src.execution.portfolio_tracker import PortfolioTracker, PositionRecord
 from src.execution.ticker_mapper import TickerMapper
+from src.strategy.autonomous_discovery import AutonomousDiscoveryEngine
 from src.strategy.intraday_data import IntradayDataProvider, IntradaySnapshot
 from src.strategy.market_hours import MarketHours
 from src.strategy.models import ExitReason, PositionExitSignal, SignalAction, TradingSignal
 
 logger = logging.getLogger(__name__)
 
-# Výchozí agresivní intradenní watchlist: Páková ETF + High-Beta volatilní giganti
+# Rozsáhlý agresivní intradenní watchlist (65+ vysoce likvidních a pákových titulů)
 DEFAULT_DAYTRADE_WATCHLIST = [
-    # 1. Páková ETF (vestavěná denní páka 2x až 3x)
+    # 1. Páková ETF (denní páka 2x až 3x)
     "TQQQ",  # 3x Leveraged Nasdaq 100
     "SOXL",  # 3x Leveraged Semiconductor & AI
     "NVDL",  # 2x Leveraged Nvidia
     "TSLL",  # 2x Leveraged Tesla
     "UPRO",  # 3x Leveraged S&P 500
     "CONL",  # 2x Leveraged Coinbase & Crypto
-    # 2. Ultra-volatilní tech & krypto lídři
+    "FNGU",  # 3x Leveraged Big Tech FANG+
+    "TECL",  # 3x Leveraged Technology
+    "DPST",  # 3x Leveraged Regional Banks
+    "LABU",  # 3x Leveraged Biotech
+    # 2. AI, polovodiče & hardware titani
     "NVDA",
     "TSLA",
-    "MSTR",  # Bitcoin proxy beta
-    "COIN",
-    "PLTR",
     "AMD",
     "ARM",
     "SMCI",
+    "AVGO",
+    "QCOM",
+    "MU",
+    "INTC",
+    "MRVL",
+    "ASML",
+    # 3. Krypto & Fintech proxy s vysokou betou
+    "MSTR",
+    "COIN",
+    "MARA",
+    "RIOT",
+    "CLSK",
+    "HOOD",
+    "SOFI",
+    "AFRM",
+    "UPST",
+    "PYPL",
+    # 4. Mega-Cap Momentum lídři
+    "AAPL",
+    "MSFT",
+    "AMZN",
+    "GOOGL",
+    "META",
+    # 5. Rychle rostoucí Cloud, AI software & kyberbezpečnost
+    "PLTR",
+    "CRWD",
+    "PANW",
+    "DDOG",
+    "NET",
+    "SNOW",
+    "APP",
+    "DELL",
+    "VRT",
+    "ORCL",
+    "NOW",
+    # 6. Žhavé novinky, IPO a small/mid-cap AI příležitosti
+    "BBAI",
+    "SOUN",
+    "RDDT",
+    "TEM",
+    "ALAB",
+    "LUMN",
+    "BRZE",
+    "LASR",
+    "VOYG",
+    "SYM",
+    # 7. Evropské momentum tituly (aktivní 09:00 - 17:30 CET)
+    "RHM.DE",
+    "RR.L",
+    "ASML.AS",
+    "SAP.DE",
+    "AIR.PA",
+    "SIE.DE",
 ]
 
 
@@ -60,11 +115,11 @@ class DayTraderEngine:
     Agresivní experimentální Day Trading & Leveraged Momentum Bot.
     
     Klíčové vlastnosti:
-    1. Sleduje 5minutové svíčky v reálném čase (VWAP, EMA Ribbon 9/21, Volume Surge, 5m RSI).
-    2. Obchoduje páková ETF (TQQQ, SOXL, NVDL, TSLL) a ultra-volatilní akcie.
-    3. Exekuce každých 60-90 sekund.
-    4. Rychlý Take Profit (+2.2 %), těsný Stop Loss (-1.2 %) a Breakeven Stop po dosažení +1.0 % zisku.
-    5. EOD ochrana: Možnost uzavřít všechny pozice před koncem dne (Flat na noc).
+    1. Sleduje široké univerzum (65+ titulů) 5minutových svíček v rychlém paralelním stahování.
+    2. Autonomně vyhledává nové akcie, čerstvá IPO a zakázky z médií a zařazuje je do sledování.
+    3. Obchoduje páková ETF (TQQQ, SOXL, NVDL, TSLL) i volatilní krypto/tech tituly.
+    4. Blesková exekuce každých 60 sekund.
+    5. Rychlý Take Profit (+2.2 %), těsný Stop Loss (-1.2 %) a Breakeven Stop po dosažení +1.0 % zisku.
     """
 
     def __init__(
@@ -73,6 +128,7 @@ class DayTraderEngine:
         tracker: Optional[PortfolioTracker] = None,
         executor: Optional[OrderExecutor] = None,
         data_provider: Optional[IntradayDataProvider] = None,
+        discovery_engine: Optional[AutonomousDiscoveryEngine] = None,
         watchlist: Optional[List[str]] = None,
         max_active_positions: int = 5,
         allocation_per_trade_eur: float = 5000.0,
@@ -86,23 +142,41 @@ class DayTraderEngine:
         self.dry_run = dry_run
         self.executor = executor or OrderExecutor(client=self.client, tracker=self.tracker, dry_run=self.dry_run)
         self.data_provider = data_provider or IntradayDataProvider(interval="5m")
-        self.watchlist = watchlist or DEFAULT_DAYTRADE_WATCHLIST
+        self.discovery_engine = discovery_engine or AutonomousDiscoveryEngine()
+        self.watchlist: List[str] = list(watchlist or DEFAULT_DAYTRADE_WATCHLIST)
         self.max_active_positions = max_active_positions
         self.allocation_per_trade_eur = allocation_per_trade_eur
         self.take_profit_pct = take_profit_pct
         self.stop_loss_pct = stop_loss_pct
         self.breakeven_trigger_pct = breakeven_trigger_pct
 
-        # Sledování nejvyšší dosažené ceny pro dynamický trailing stop
+        # Sledování stavu obchodu
         self._peak_prices: Dict[str, float] = {}
         self._breakeven_applied: Set[str] = set()
+        self._last_discovery_ts: float = 0.0
 
-    def evaluate_ticker_setup(self, ticker: str) -> Optional[DayTradeSignal]:
-        """Vyhodnotí intradenní 5m setup na grafu a spočítá DayTradeScore (0 až 100)."""
-        snap = self.data_provider.fetch_intraday_snapshot(ticker)
-        if not snap:
-            return None
+    def discover_new_daytrade_tickers(self, max_new: int = 4) -> List[str]:
+        """Skenuje breaking zprávy na nová technologická IPO, kontrakty a zařazuje je do watchlistu."""
+        try:
+            logger.info("📡 [Day Trader Discovery] Prohledávám breaking news na nová IPO, AI kontrakty a momentum tituly...")
+            new_opps = self.discovery_engine.discover_and_register_opportunities(max_new_per_run=max_new)
+            added_tickers: List[str] = []
+            for opp in new_opps:
+                clean_t = opp.ticker.strip().upper()
+                if clean_t not in self.watchlist:
+                    self.watchlist.append(clean_t)
+                    added_tickers.append(clean_t)
+                    logger.info(
+                        f"🚀 [DAY TRADER DISCOVERY] Nový titul zařazen do aktivního intradenního skenování: "
+                        f"{clean_t} ({opp.company_name}) | Cena: {opp.price:.2f} USD | \"{opp.headline[:65]}...\""
+                    )
+            return added_tickers
+        except Exception as exc:
+            logger.debug(f"Chyba při autonomním vyhledávání titulů pro Day Trader: {exc}")
+            return []
 
+    def evaluate_snapshot(self, snap: IntradaySnapshot) -> DayTradeSignal:
+        """Vyhodnotí intradenní profil a spočítá DayTradeScore (0 až 100)."""
         score = 0.0
         reasons = []
 
@@ -116,7 +190,6 @@ class DayTraderEngine:
                 score += 18.0
                 reasons.append("Cena nad VWAP (býčí teritorium)")
         else:
-            # Cena pod VWAP je v day tradingu medvědí
             score -= 10.0
 
         # 2. EMA 9 / 21 Scalp Ribbon (+25 b)
@@ -141,17 +214,17 @@ class DayTraderEngine:
             reasons.append(f"5m RSI v optimálním momentum pásmu ({snap.rsi_5m:.1f})")
         elif snap.rsi_5m < 35.0:
             score += 12.0
-            reasons.append(f"5m RSI přeprodané ({snap.rsi_5m:.1f}) - možný rychlý odraz")
+            reasons.append(f"5m RSI přeprodané ({snap.rsi_5m:.1f}) - možný odraz")
         elif snap.rsi_5m > 72.0:
             score -= 12.0
-            reasons.append(f"5m RSI překoupené ({snap.rsi_5m:.1f}) - pozor na korekci")
+            reasons.append(f"5m RSI překoupené ({snap.rsi_5m:.1f}) - riziko korekce")
 
         # 5. Proražení 30minutového maxima (+15 b)
         if snap.is_breaking_high:
             score += 15.0
             reasons.append("Proražení 30minutového lokálního maxima")
 
-        # Zaokrouhlení a mantinely skóre
+        # Zaokrouhlení skóre
         score = max(0.0, min(100.0, round(score, 1)))
 
         # Výpočet dynamického Stop Lossu a Take Profitu
@@ -184,7 +257,7 @@ class DayTraderEngine:
         Zkontroluje otevřené day trade pozice v reálném čase:
         - Take Profit (+2.2 %)
         - Stop Loss (-1.2 %)
-        - Breakeven Stop (při +1.0 % posun na nákup)
+        - Breakeven Stop (při +1.0 % zisku posun na nákup)
         - Trailing Stop pro běžící zisky
         """
         closed_reports: List[Dict[str, Any]] = []
@@ -208,14 +281,14 @@ class DayTraderEngine:
                 self._peak_prices[ticker] = current_price
                 peak = current_price
 
-            # 1. Kontrola Breakeven posunu při zisku >= breakeven_trigger_pct
+            # 1. Breakeven Stop při zisku >= breakeven_trigger_pct
             if pnl_pct >= self.breakeven_trigger_pct and ticker not in self._breakeven_applied:
-                pos.stop_loss_price = round(entry_price * 1.001, 2)  # Zajištění nákupní ceny + fee buffer
+                pos.stop_loss_price = round(entry_price * 1.001, 2)
                 self._breakeven_applied.add(ticker)
                 self.tracker.save_portfolio()
                 logger.info(f"🛡️ [BREAKEVEN AKTIVOVÁN] {ticker}: Zisk dosáhl +{pnl_pct:.2f} %. Stop Loss posunut na nákupní cenu ({pos.stop_loss_price:.2f} USD).")
 
-            # 2. Dynamický Trailing Stop pro běžící vítěze
+            # 2. Dynamický Trailing Stop pro běžící zisky
             if pnl_pct >= 2.0:
                 trailing_level = round(peak - (snap.atr_5m * 1.2), 2)
                 if trailing_level > pos.stop_loss_price:
@@ -270,7 +343,6 @@ class DayTraderEngine:
         buy_signals.sort(key=lambda s: s.score, reverse=True)
 
         for sig in buy_signals[:available_slots]:
-            # Zformování TradingSignalu pro standardní OrderExecutor
             std_signal = TradingSignal(
                 ticker=sig.ticker,
                 action=SignalAction.BUY,
@@ -308,24 +380,26 @@ class DayTraderEngine:
         return opened_reports
 
     def run_one_scan(self) -> Dict[str, Any]:
-        """Provede jeden rychlý intradenní cyklus (audit pozic + sken grafů + nákupy)."""
+        """Provede jeden rychlý intradenní cyklus (audit pozic + rychlý batch sken grafů + nákupy)."""
         now = datetime.now()
-        logger.info(f"⚡ [DAY TRADER SCAN] Zahajuji 5m intradenní sken ({now.strftime('%H:%M:%S')})...")
+        logger.info(f"⚡ [DAY TRADER SCAN] Skenuji {len(self.watchlist)} intradenních titulů ({now.strftime('%H:%M:%S')})...")
 
         # 1. Audit držených pozic
         closed = self.audit_active_positions()
 
-        # 2. Skenování watchlistu
-        evaluated_signals: List[DayTradeSignal] = []
-        for ticker in self.watchlist:
-            try:
-                sig = self.evaluate_ticker_setup(ticker)
-                if sig:
-                    evaluated_signals.append(sig)
-            except Exception as exc:
-                logger.debug(f"Chyba při skenu {ticker}: {exc}")
+        # 2. Rychlé paralelní stažení a výpočet indikátorů pro celý široký watchlist
+        snapshots = self.data_provider.fetch_batch_snapshots(self.watchlist)
 
-        # 3. Exekuce nových nákupů
+        # 3. Vyhodnocení signálů
+        evaluated_signals: List[DayTradeSignal] = []
+        for ticker, snap in snapshots.items():
+            try:
+                sig = self.evaluate_snapshot(snap)
+                evaluated_signals.append(sig)
+            except Exception as exc:
+                logger.debug(f"Chyba při vyhodnocení {ticker}: {exc}")
+
+        # 4. Exekuce nových nákupů
         opened = self.execute_daytrade_buys(evaluated_signals)
 
         return {
@@ -333,18 +407,20 @@ class DayTraderEngine:
             "closed_trades": closed,
             "opened_trades": opened,
             "signals": evaluated_signals,
+            "total_monitored": len(self.watchlist),
         }
 
-    def start_loop(self, scan_interval_seconds: int = 60, close_at_eod: bool = False) -> None:
+    def start_loop(self, scan_interval_seconds: int = 60, discovery_interval_minutes: int = 15) -> None:
         """
         Spustí nepřetržitou Day Trading smyčku (výchozí interval: 60 sekund).
-        Běží během otevřených trhů, sleduje grafy a provádí rychlé vstupy a výstupy.
+        Průběžně vyhledává nové tituly z médií a provádí rychlé vstupy a výstupy.
         """
         print("\n" + "=" * 70)
         print("          ⚡ AI DAY TRADER & LEVERAGED MOMENTUM ENGINE ⚡       ")
         print("=" * 70)
         print(f"  Frekvence skenování:  Každých {scan_interval_seconds} sekund")
-        print(f"  Pákový watchlist:     {', '.join(self.watchlist)}")
+        print(f"  Sledováno titulů:     {len(self.watchlist)} aktivních akcií & pákových ETF")
+        print(f"  Autonomní discovery:  Každých {discovery_interval_minutes} minut hledá nové akcie z médií")
         print(f"  Alokace na obchod:    {self.allocation_per_trade_eur:,.0f} EUR")
         print(f"  Max otevřených pozic: {self.max_active_positions}")
         print(f"  Cílový Take Profit:   +{self.take_profit_pct:.1f} % (nebo 2x ATR)")
@@ -354,9 +430,19 @@ class DayTraderEngine:
         print("=" * 70 + "\n")
         print("Stiskněte Ctrl+C pro bezpečné zastavení Day Tradera.\n")
 
+        # Úvodní prohledání zpráv na čerstvé objevy
+        self.discover_new_daytrade_tickers(max_new=4)
+        self._last_discovery_ts = time.time()
+
         try:
             while True:
                 market_stat = MarketHours.get_market_status()
+                now_ts = time.time()
+
+                # Periodické hledání nových titulů ze zpráv každých X minut
+                if (now_ts - self._last_discovery_ts) >= (discovery_interval_minutes * 60):
+                    self._last_discovery_ts = now_ts
+                    self.discover_new_daytrade_tickers(max_new=4)
 
                 if market_stat["is_open"]:
                     cycle_res = self.run_one_scan()
@@ -364,6 +450,7 @@ class DayTraderEngine:
 
                     # Tisk živého terminálového přehledu
                     print(f"\n--- [DAY TRADER STATUS {datetime.now().strftime('%H:%M:%S')}] ---")
+                    print(f"Sledováno v reálném čase: {len(self.watchlist)} titulů (Páková ETF, Tech lídři, Nové zprávy)")
                     open_pos = self.tracker.get_open_positions()
                     if open_pos:
                         print(f"Otevřené pozice ({len(open_pos)} / {self.max_active_positions}):")
@@ -379,11 +466,11 @@ class DayTraderEngine:
 
                     print("\nTop intradenní momentum signály:")
                     signals.sort(key=lambda s: s.score, reverse=True)
-                    for s in signals[:6]:
+                    for s in signals[:8]:
                         above_str = "NAD VWAP ▲" if (s.current_price > s.vwap) else "POD VWAP ▼"
                         action_icon = "🟢 BUY " if s.action == SignalAction.BUY else "⚪ HOLD"
                         print(
-                            f"  {action_icon} {s.ticker:<6} | Skóre: {s.score:4.1f}/100 | "
+                            f"  {action_icon} {s.ticker:<7} | Skóre: {s.score:4.1f}/100 | "
                             f"Cena: {s.current_price:7.2f} USD ({above_str}) | "
                             f"5m RSI: {s.rsi_5m:4.1f} | Objem: {s.volume_surge:3.1f}x"
                         )
