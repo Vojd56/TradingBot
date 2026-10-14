@@ -13,6 +13,7 @@ from src.execution.ticker_mapper import TickerMapper
 from src.llm.sentiment_engine import SentimentEngine
 from src.strategy.autonomous_discovery import AutonomousDiscoveryEngine
 from src.strategy.intraday_data import IntradayDataProvider, IntradaySnapshot
+from src.strategy.macro_regime import MarketRegime, MarketRegimeDetector, RegimeSnapshot
 from src.strategy.market_hours import MarketHours
 from src.strategy.models import ExitReason, PositionExitSignal, SignalAction, TradingSignal
 
@@ -141,6 +142,7 @@ class DayTraderEngine:
         max_daily_loss_eur: float = 750.0,  # Maximální povolená denní ztráta (Circuit Breaker)
         max_consecutive_losses: int = 3,   # Stop po 3 ztrátách v řadě (ochrana před nepříznivým trhem)
         sentiment_engine: Optional[SentimentEngine] = None,
+        regime_detector: Optional[MarketRegimeDetector] = None,
         dry_run: bool = False,
     ):
         self.client = client or Trading212Client()
@@ -150,6 +152,8 @@ class DayTraderEngine:
         self.data_provider = data_provider or IntradayDataProvider(interval="5m")
         self.discovery_engine = discovery_engine or AutonomousDiscoveryEngine()
         self.sentiment_engine = sentiment_engine or SentimentEngine()
+        self.regime_detector = regime_detector or MarketRegimeDetector(sentiment_engine=self.sentiment_engine)
+        self.current_regime_snapshot: Optional[RegimeSnapshot] = None
         self.watchlist: List[str] = list(watchlist or DEFAULT_DAYTRADE_WATCHLIST)
         self.max_active_positions = max_active_positions
         self.allocation_per_trade_eur = allocation_per_trade_eur
@@ -407,6 +411,12 @@ class DayTraderEngine:
             logger.info("Circuit Breaker je aktivní: nové nákupy jsou pro dnešek zablokovány.")
             return opened_reports
 
+        if self.current_regime_snapshot and not self.current_regime_snapshot.allow_new_buys:
+            logger.warning(
+                f"Makro režim ({self.current_regime_snapshot.regime.value}) blokuje nové long nákupy: {self.current_regime_snapshot.reasoning}"
+            )
+            return opened_reports
+
         open_positions = self.get_all_active_positions()
         available_slots = max(0, self.max_active_positions - len(open_positions))
 
@@ -523,6 +533,17 @@ class DayTraderEngine:
         now = datetime.now()
         logger.info(f"⚡ [DAY TRADER SCAN] Skenuji {len(self.watchlist)} intradenních titulů ({now.strftime('%H:%M:%S')})...")
 
+        # 0. Vyhodnocení globálního tržního režimu (Macro Regime Classifier na NPU)
+        try:
+            regime = self.regime_detector.evaluate_regime()
+            self.current_regime_snapshot = regime
+            self.take_profit_pct = regime.take_profit_pct
+            self.stop_loss_pct = regime.stop_loss_pct
+            self.breakeven_trigger_pct = regime.breakeven_pct
+            self.max_active_positions = regime.max_active_positions
+        except Exception as reg_err:
+            logger.debug(f"Chyba při detekci makro režimu: {reg_err}")
+
         # 1. Audit držených pozic
         closed = self.audit_active_positions()
 
@@ -592,7 +613,17 @@ class DayTraderEngine:
                     # Tisk živého terminálového přehledu
                     print(f"\n--- [DAY TRADER STATUS {datetime.now().strftime('%H:%M:%S')}] ---")
                     mode_label = "🟡 SIMULACE (--dry-run: příkazy se na burzu neposílají)" if self.dry_run else "🟢 LIVE EXEKUCE (Reálný demo účet Trading 212)"
-                    print(f"Režim:                   {mode_label}")
+                    print(f"Režim bota:              {mode_label}")
+                    if self.current_regime_snapshot:
+                        snap = self.current_regime_snapshot
+                        if snap.regime == MarketRegime.RISK_ON_BULL:
+                            reg_icon = "🟢 RISK-ON BULL (Silný růst)"
+                        elif snap.regime == MarketRegime.RISK_OFF_PANIC:
+                            reg_icon = "🔴 RISK-OFF PANIC (Výprodeje - nákupy STOP)"
+                        else:
+                            reg_icon = "🟡 NEUTRAL CHOPPY (Rychlé skalpy)"
+                        llm_tag = " [NPU AI]" if snap.llm_used else ""
+                        print(f"Tržní AI režim:          {reg_icon}{llm_tag} | VIX: {snap.vix:.1f} | SPY: {snap.spy_change_pct:+.2f} % | TP: +{snap.take_profit_pct:.1f} % | BE: +{snap.breakeven_pct:.1f} %")
                     print(f"Sledováno v reálném čase: {len(self.watchlist)} titulů (Páková ETF, Tech lídři, Nové zprávy)")
                     win_pct = (self._session_wins / self._session_trades_count * 100.0) if self._session_trades_count > 0 else 0.0
                     pnl_sign = "+" if self._daily_realized_pnl_eur >= 0 else ""
