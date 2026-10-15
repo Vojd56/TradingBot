@@ -26,7 +26,7 @@ Projekt obsahuje dva hlavní obchodní módy:
 * **Časový rámec:** 5minutové intradenní svíčky, kontrola každých 60 sekund.
 * **Watchlist:** 65+ vysoce likvidních titulů (páková ETF 2x/3x jako `TQQQ`, `SOXL`, `NVDL`, `TSLL`, technologičtí lídři, krypto proxy) + dynamicky objevované akcie ze světových zpráv.
 * **Indikátory:** VWAP (Volume-Weighted Average Price), EMA Ribbon 9/21, Volume Surge Ratio, 5m RSI.
-* **Exekuce & Risk:** Cílový Take Profit +2.2 %, těsný Stop Loss -1.2 %, automatický posun na Breakeven při zisku +1.0 %, dynamický Trailing Stop.
+* **Exekuce & Risk:** Cílový Take Profit +2.2 %, těsný Stop Loss -1.2 %, automatický posun na Breakeven při zisku +1.0 %, dynamický Trailing Stop, kapacita až 15 souběžných pozic (alokace ~3 300 EUR / pozice).
 
 ### B) Režim Swing / Value Investor (Konzervativní)
 * **Spuštění:** `python main.py --daemon` nebo skript `run_daemon.cmd`

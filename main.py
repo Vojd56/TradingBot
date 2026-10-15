@@ -516,6 +516,12 @@ def main():
         help="Interval skenování v sekundách pro Day Trading režim (výchozí: 60 s).",
     )
     parser.add_argument(
+        "--max-positions",
+        type=int,
+        default=None,
+        help=f"Maximální počet otevřených pozic (výchozí: {settings.max_positions}).",
+    )
+    parser.add_argument(
         "--scan",
         action="store_true",
         help="Spustí okamžitý hloubkový sken globálního trhu s Radou AI (Fundament + Skeptik + Katalyzátory) a uloží schválené příležitosti.",
@@ -546,7 +552,7 @@ def main():
     args = parser.parse_args()
 
     if args.daytrade:
-        daytrader = DayTraderEngine(dry_run=args.dry_run)
+        daytrader = DayTraderEngine(max_active_positions=args.max_positions, dry_run=args.dry_run)
         daytrader.start_loop(scan_interval_seconds=args.interval)
         return
 

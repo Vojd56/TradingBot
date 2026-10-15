@@ -16,6 +16,7 @@ from src.strategy.intraday_data import IntradayDataProvider, IntradaySnapshot
 from src.strategy.macro_regime import MarketRegime, MarketRegimeDetector, RegimeSnapshot
 from src.strategy.market_hours import MarketHours
 from src.strategy.models import ExitReason, PositionExitSignal, SignalAction, TradingSignal
+from config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -134,8 +135,8 @@ class DayTraderEngine:
         data_provider: Optional[IntradayDataProvider] = None,
         discovery_engine: Optional[AutonomousDiscoveryEngine] = None,
         watchlist: Optional[List[str]] = None,
-        max_active_positions: int = 5,
-        allocation_per_trade_eur: float = 5000.0,
+        max_active_positions: Optional[int] = None,
+        allocation_per_trade_eur: Optional[float] = None,
         take_profit_pct: float = 2.2,     # +2.2 % rychlý skalp zisku
         stop_loss_pct: float = 1.2,       # -1.2 % těsný stop loss
         breakeven_trigger_pct: float = 1.0, # Při +1.0 % zisku posun stop-lossu na nákup
@@ -152,7 +153,12 @@ class DayTraderEngine:
         self.data_provider = data_provider or IntradayDataProvider(interval="5m")
         self.discovery_engine = discovery_engine or AutonomousDiscoveryEngine()
         self.sentiment_engine = sentiment_engine or SentimentEngine()
-        self.regime_detector = regime_detector or MarketRegimeDetector(sentiment_engine=self.sentiment_engine)
+        self.max_active_positions = max_active_positions if max_active_positions is not None else settings.max_positions
+        self._configured_max_positions = self.max_active_positions
+        self.regime_detector = regime_detector or MarketRegimeDetector(
+            sentiment_engine=self.sentiment_engine,
+            max_positions=self.max_active_positions,
+        )
         self.current_regime_snapshot: Optional[RegimeSnapshot] = None
         self.watchlist: List[str] = list(watchlist or DEFAULT_DAYTRADE_WATCHLIST)
         # Dynamické načtení ověřených příležitostí z Rady AI (ScheduledMarketScanner)
@@ -167,8 +173,11 @@ class DayTraderEngine:
         except Exception:
             pass
 
-        self.max_active_positions = max_active_positions
-        self.allocation_per_trade_eur = allocation_per_trade_eur
+        if allocation_per_trade_eur is not None:
+            self.allocation_per_trade_eur = allocation_per_trade_eur
+        else:
+            # Dynamická kalkulace (např. 50 000 EUR / 15 pozic = 3 300 EUR na pozici)
+            self.allocation_per_trade_eur = round(settings.initial_capital_eur / max(1, self.max_active_positions), -2)
         self.take_profit_pct = take_profit_pct
         self.stop_loss_pct = stop_loss_pct
         self.breakeven_trigger_pct = breakeven_trigger_pct
@@ -567,7 +576,10 @@ class DayTraderEngine:
             self.take_profit_pct = regime.take_profit_pct
             self.stop_loss_pct = regime.stop_loss_pct
             self.breakeven_trigger_pct = regime.breakeven_pct
-            self.max_active_positions = regime.max_active_positions
+            if not regime.allow_new_buys:
+                self.max_active_positions = 0
+            else:
+                self.max_active_positions = min(self._configured_max_positions, regime.max_active_positions)
         except Exception as reg_err:
             logger.debug(f"Chyba při detekci makro režimu: {reg_err}")
 

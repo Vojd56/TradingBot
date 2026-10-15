@@ -9,6 +9,7 @@ from typing import Any, Dict, List, Optional
 import yfinance as yf
 
 from src.llm.sentiment_engine import SentimentEngine
+from config import settings
 
 logger = logging.getLogger(__name__)
 
@@ -48,9 +49,11 @@ class MarketRegimeDetector:
         self,
         sentiment_engine: Optional[SentimentEngine] = None,
         cache_ttl_seconds: int = 1800,  # 30 minut cache pro klidný chod
+        max_positions: Optional[int] = None,
     ):
         self.sentiment_engine = sentiment_engine or SentimentEngine()
         self.cache_ttl_seconds = cache_ttl_seconds
+        self.max_positions = max_positions or settings.max_positions
         self._cached_snapshot: Optional[RegimeSnapshot] = None
         self._last_evaluated_ts: float = 0.0
 
@@ -104,7 +107,7 @@ class MarketRegimeDetector:
                 take_profit_pct=2.8,
                 stop_loss_pct=1.2,
                 breakeven_pct=1.0,
-                max_active_positions=6,
+                max_active_positions=self.max_positions,
                 allow_new_buys=True,
                 reasoning=f"{reason_prefix}Nízký VIX ({vix}) a růst indexu SPY ({spy_chg:+.2f} %). Optimální býčí podmínky pro trend.",
                 llm_used=False,
@@ -117,7 +120,7 @@ class MarketRegimeDetector:
                 take_profit_pct=1.6,
                 stop_loss_pct=1.0,
                 breakeven_pct=0.7,
-                max_active_positions=5,
+                max_active_positions=self.max_positions,
                 allow_new_buys=True,
                 reasoning=f"{reason_prefix}Mírná volatilita (VIX: {vix}, SPY: {spy_chg:+.2f} %). Rychlé skalpy a včasný Breakeven.",
                 llm_used=False,
@@ -169,13 +172,13 @@ class MarketRegimeDetector:
 
                 if "BULL" in reg_str or "RISK_ON" in reg_str:
                     regime = MarketRegime.RISK_ON_BULL
-                    tp, sl, be, slots, buys = 2.8, 1.2, 1.0, 6, True
+                    tp, sl, be, slots, buys = 2.8, 1.2, 1.0, self.max_positions, True
                 elif "PANIC" in reg_str or "RISK_OFF" in reg_str or vix >= 26.0:
                     regime = MarketRegime.RISK_OFF_PANIC
                     tp, sl, be, slots, buys = 1.5, 1.0, 0.7, 0, False
                 else:
                     regime = MarketRegime.NEUTRAL_CHOPPY
-                    tp, sl, be, slots, buys = 1.6, 1.0, 0.7, 5, True
+                    tp, sl, be, slots, buys = 1.6, 1.0, 0.7, self.max_positions, True
 
                 snapshot = RegimeSnapshot(
                     regime=regime,
