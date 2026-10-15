@@ -11,9 +11,11 @@ Sjednocuje 8modulovou kvantitativní architekturu dle research.md:
 """
 
 from datetime import datetime
+import json
 import logging
+from pathlib import Path
 import time
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Set
 import pandas as pd
 from pydantic import BaseModel
 
@@ -28,6 +30,8 @@ from src.quant.prediction_model import ExpectedValueResult, PredictionModel
 from src.quant.regime_detector import MarketRegime, MarketRegimeType, RegimeDetector
 from src.quant.signal_engine import CarverSignalEngine, QuantSignal, SignalAction
 from src.quant.risk_engine import CarverRiskEngine, PositionSizingResult
+from src.strategy.opportunity_scanner import OpportunityScanner
+from src.strategy.trade_reflection import TradeReflectionEngine
 
 logger = logging.getLogger(__name__)
 
@@ -63,10 +67,12 @@ class QuantTraderEngine:
     ):
         self.benchmark_symbol = benchmark_symbol
         self.dry_run = dry_run
-        self.watchlist = watchlist or settings.watched_tickers
+        self.opportunity_scanner = OpportunityScanner()
+        self.watchlist = watchlist or self.opportunity_scanner.get_all_universe_tickers()
         self.client = client or Trading212Client()
         self.data_provider = data_provider or MarketDataProvider()
         self.tracker = tracker or PortfolioTracker()
+        self.reflection_engine = TradeReflectionEngine()
 
         # Inicializace 8 modulů kvantitativní architektury
         self.regime_detector = RegimeDetector()
@@ -196,14 +202,46 @@ class QuantTraderEngine:
         sizing_results: Dict[str, PositionSizingResult] = {}
         executed_orders: List[ExecutionOrder] = []
 
-        # Řazení kandidátů podle čistého EV sestupně
-        qualifying_buys.sort(key=lambda t: ev_results[t].ev_net_pct, reverse=True)
+        # Načtení schválených příležitostí z Rady AI (Qwen)
+        ai_approved_tickers: Set[str] = set()
+        qual_file = Path("data/qualified_opportunities.json")
+        if qual_file.exists():
+            try:
+                with open(qual_file, "r", encoding="utf-8") as f:
+                    q_data = json.load(f)
+                    for opp in q_data.get("opportunities", []):
+                        if opp.get("approved_for_trading", False):
+                            ai_approved_tickers.add(opp.get("ticker", "").strip().upper())
+            except Exception as e:
+                logger.debug(f"Nelze načíst qualified_opportunities.json: {e}")
+
+        # Řazení kandidátů: přednost mají tituly s konsenzem Rady AI (Qwen) a vyšším EV_net
+        qualifying_buys.sort(
+            key=lambda t: (1 if t.upper() in ai_approved_tickers else 0, ev_results[t].ev_net_pct),
+            reverse=True
+        )
 
         remaining_cash = free_cash
         for ticker in qualifying_buys:
             ev = ev_results[ticker]
             feat = features_map[ticker]
             curr_shares = current_positions.get(ticker, 0.0)
+
+            # Kontrola paměti chyb přes Qwen TradeReflectionEngine (VETO check)
+            vwap_proxy = feat.current_price / max(1e-4, (1.0 + feat.mean_reversion_z_20 * 0.01))
+            reflection_check = self.reflection_engine.verify_pre_trade_memory(
+                ticker=ticker,
+                current_price=feat.current_price,
+                current_rsi=50.0 + feat.mean_reversion_z_20 * 10.0,
+                vwap=vwap_proxy,
+                score=ev.ev_net_pct * 30.0,
+            )
+            if not reflection_check.get("approved", True):
+                logger.warning(f"🚫 [VETO - Paměť chyb Qwen] Obchod pro {ticker} byl zablokován: {reflection_check.get('reason')}")
+                continue
+
+            if ticker.upper() in ai_approved_tickers:
+                logger.info(f"⭐ [Rada AI Konsenzus] {ticker} má ověřený nákupní konsenzus z hloubkového skenu Rady AI.")
 
             # Výpočet cílové velikosti pozice
             sizing = self.risk_engine.calculate_position_size(
