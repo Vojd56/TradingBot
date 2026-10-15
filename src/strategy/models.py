@@ -1,7 +1,7 @@
 from datetime import datetime
 from enum import Enum
-from typing import List, Optional
-from pydantic import BaseModel, Field
+from typing import Any, List, Optional
+from pydantic import BaseModel, Field, field_validator
 
 
 class SignalAction(str, Enum):
@@ -39,6 +39,33 @@ class TradingSignal(BaseModel):
     
     reasons: List[str] = Field(default_factory=list, description="Klíčové důvody rozhodnutí")
     timestamp: datetime = Field(default_factory=datetime.now)
+
+    @field_validator("sentiment_score", mode="before")
+    @classmethod
+    def clamp_sentiment(cls, v: Any) -> float:
+        try:
+            val = float(v)
+            return max(0.0, min(50.0, round(val, 2)))
+        except (ValueError, TypeError):
+            return 25.0
+
+    @field_validator("technical_score", mode="before")
+    @classmethod
+    def clamp_technical(cls, v: Any) -> float:
+        try:
+            val = float(v)
+            return max(0.0, min(50.0, round(val, 2)))
+        except (ValueError, TypeError):
+            return 25.0
+
+    @field_validator("total_score", mode="before")
+    @classmethod
+    def clamp_total(cls, v: Any) -> float:
+        try:
+            val = float(v)
+            return max(0.0, min(100.0, round(val, 2)))
+        except (ValueError, TypeError):
+            return 50.0
 
 
 class PositionExitSignal(BaseModel):

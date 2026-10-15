@@ -7,8 +7,11 @@ import sys
 if not (hasattr(sys, "real_prefix") or (hasattr(sys, "base_prefix") and sys.base_prefix != sys.prefix)):
     venv_py = Path(__file__).resolve().parent / "venv" / "Scripts" / "python.exe"
     if venv_py.exists():
-        res = subprocess.run([str(venv_py), str(Path(__file__).resolve()), *sys.argv[1:]])
-        sys.exit(res.returncode)
+        try:
+            res = subprocess.run([str(venv_py), str(Path(__file__).resolve()), *sys.argv[1:]])
+            sys.exit(res.returncode)
+        except KeyboardInterrupt:
+            sys.exit(0)
 
 import argparse
 from datetime import datetime
