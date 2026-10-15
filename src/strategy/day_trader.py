@@ -161,17 +161,8 @@ class DayTraderEngine:
         )
         self.current_regime_snapshot: Optional[RegimeSnapshot] = None
         self.watchlist: List[str] = list(watchlist or DEFAULT_DAYTRADE_WATCHLIST)
-        # Dynamické načtení ověřených příležitostí z Rady AI (ScheduledMarketScanner)
-        try:
-            from src.strategy.scheduled_scanner import ScheduledMarketScanner
-            qualified = ScheduledMarketScanner.load_qualified_tickers()
-            for q in qualified:
-                if q not in self.watchlist:
-                    self.watchlist.append(q)
-            if qualified:
-                logger.info(f"Day Trader zařadil {len(qualified)} schválených titulů z Rady AI do aktivního sledování.")
-        except Exception:
-            pass
+        # Načtení ověřených příležitostí z Rady AI (data/qualified_opportunities.json)
+        self.reload_qualified_opportunities()
 
         if allocation_per_trade_eur is not None:
             self.allocation_per_trade_eur = allocation_per_trade_eur
@@ -213,6 +204,25 @@ class DayTraderEngine:
         if self.dry_run:
             res.update(self._dry_run_positions)
         return res
+
+    def reload_qualified_opportunities(self) -> List[str]:
+        """Dynamicky za běhu načte nově schválené příležitosti z Rady AI a zařadí je do watchlistu."""
+        try:
+            from src.strategy.scheduled_scanner import ScheduledMarketScanner
+            qualified = ScheduledMarketScanner.load_qualified_tickers()
+            newly_added = []
+            for q in qualified:
+                clean_q = str(q).strip().upper()
+                if clean_q and clean_q not in self.watchlist:
+                    self.watchlist.append(clean_q)
+                    newly_added.append(clean_q)
+            if newly_added:
+                logger.info(f"✨ [Dynamický update] Day Trader zařadil {len(newly_added)} nových titulů z Rady AI: {newly_added}")
+                print(f"  ✨ [NOVÝ TITUL Z RADY AI] Do sledování za běhu zařazeno: {', '.join(newly_added)}")
+            return newly_added
+        except Exception as exc:
+            logger.debug(f"Chyba při reloadu schválených příležitostí: {exc}")
+            return []
 
     def discover_new_daytrade_tickers(self, max_new: int = 4) -> List[str]:
         """Skenuje breaking zprávy na nová technologická IPO, kontrakty a zařazuje je do watchlistu."""
@@ -585,6 +595,9 @@ class DayTraderEngine:
 
         # 1. Audit držených pozic
         closed = self.audit_active_positions()
+
+        # 1.5. Dynamická synchronizace nově schválených titulů z Rady AI (pokud za běhu doběhl sken)
+        self.reload_qualified_opportunities()
 
         # 2. Rychlé paralelní stažení a výpočet indikátorů pro celý široký watchlist
         snapshots = self.data_provider.fetch_batch_snapshots(self.watchlist)
