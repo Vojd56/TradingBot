@@ -229,10 +229,10 @@ class QuantTraderEngine:
 
             # Kontrola paměti chyb přes Qwen TradeReflectionEngine (VETO check)
             vwap_proxy = feat.current_price / max(1e-4, (1.0 + feat.mean_reversion_z_20 * 0.01))
-            reflection_check = self.reflection_engine.verify_pre_trade_memory(
+            reflection_check = self.reflection_engine.check_candidate_against_memory(
                 ticker=ticker,
                 current_price=feat.current_price,
-                current_rsi=50.0 + feat.mean_reversion_z_20 * 10.0,
+                rsi_5m=50.0 + feat.mean_reversion_z_20 * 10.0,
                 vwap=vwap_proxy,
                 score=ev.ev_net_pct * 30.0,
             )
