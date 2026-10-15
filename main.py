@@ -41,6 +41,7 @@ from src.strategy.intelligence_cache import IntelligenceCache
 from src.strategy.market_hours import MarketHours
 from src.strategy.scheduled_scanner import ScheduledMarketScanner
 from src.strategy.trade_reflection import TradeReflectionEngine
+from src.strategy.quant_trader import QuantTraderEngine
 
 # Vytvoření adresáře pro logy a reporty
 LOGS_DIR = Path("logs")
@@ -620,8 +621,32 @@ def main():
         action="store_true",
         help="Vynutí spuštění cyklu i o víkendu při --run-once.",
     )
+    parser.add_argument(
+        "--quant",
+        "--quant-trader",
+        action="store_true",
+        dest="quant_trader",
+        help="Spustí pokročilou 8modulovou kvantitativní strategii dle research.md (Carver Volatility Targeting, Triple-Barrier, EV_net, Kill-Switches).",
+    )
+    parser.add_argument(
+        "--quant-benchmark",
+        type=str,
+        default="SPY",
+        help="Benchmark symbol pro detekci tržního režimu (výchozí: SPY).",
+    )
 
     args = parser.parse_args()
+
+    if args.quant_trader:
+        engine = QuantTraderEngine(
+            benchmark_symbol=args.quant_benchmark,
+            dry_run=args.dry_run,
+        )
+        if args.run_once:
+            engine.run_cycle()
+        else:
+            engine.start_loop(interval_seconds=args.interval if args.interval != 60 else 300)
+        return
 
     if args.daytrade:
         daytrader = DayTraderEngine(max_active_positions=args.max_positions, dry_run=args.dry_run)

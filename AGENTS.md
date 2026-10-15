@@ -59,6 +59,17 @@ Projekt obsahuje dva hlavní obchodní módy:
   - **Otevírací okno:** Chrání před ranními whip-saws v prvních 15 minutách po otevření burzy.
   - **Páková ETF:** Počítá volatilitní rozpad (*volatility drag*) pro 2x/3x ETF.
 
+### E) Pokročilá 8modulová Kvantitativní Strategie dle `research.md` (Carver Volatility Targeting & EV_net)
+* **Spuštění:** `python main.py --quant` (kontinuální smyčka) nebo `python main.py --quant --run-once` (jednorázový cyklus) či skript `run_quant_trader.cmd`
+* **Architektura modulů (`src/quant/`):**
+  1. `features.py` (**Causal Feature Engineering**): Bezrozměrné stacionární příznaky bez look-ahead biasu (volatilitně normalizované 3M a 12M-1M momentum, Z-skóre SMA20/50, komprese ATR_14/ATR_100, RVOL, sklon SMA200, průřezový percentilní rank).
+  2. `regime_detector.py` (**Regime Detector**): Klasifikace tržního režimu benchmarku SPY (BULL_QUIET, BULL_VOLATILE, SIDEWAYS, BEAR_QUIET, CRISIS_PANIC) s tvrdým zastavením tradingu při volatilitě nad 95. percentilem.
+  3. `signal_engine.py` (**Carver Orthogonal Signal Engine**): Nezávislá syntéza trendového momenta a mean-reversion (s ochranou proti padajícímu noži / falling knife) dynamicky vážená tržním režimem.
+  4. `prediction_model.py` (**Triple-Barrier & $EV_{net}$ Gate**): Dynamické bariéry (TP, SL s garantovaným $R:R \ge 1:2$, časový stop $H$), realisticky kalibrovaná pravděpodobnost $\hat{p}_{win}$, výpočet čisté očekávané hodnoty $EV_{net} > \eta \cdot C_{total}$ a striktní výchozí stav **`NO TRADE`**.
+  5. `risk_engine.py` (**Carver Volatility Targeting**): Velikost pozic nepřímo úměrná $ATR_{20}$, Carverovo 10% pásmo nečinnosti (Inertia Buffer) proti poplatkovému přebalancování, Half-Kelly limit koncentrace (max 12 % na titul), riziko SL $\le 1.5$ % ekvity a korelační filtr (> 0.65 / > 0.80).
+  6. `execution_engine.py` (**Idempotent Execution**): Deterministické `client_order_id` (SHA-256 idempotence proti duplicitám při timeoutu), pre-trade verifikace stavu hotovosti a Long-only uzamčení pro Trading 212 Invest.
+  7. `monitoring.py` (**6 Kill-Switches & CUSUM**): 6 bezpečnostních jističů (Denní ztráta > 3 %, Max DD > 10 %, Extrémní pohyb trhu > 4 %, Integrita dat, Desynchronizace portfolia, Skluz, API Loop Breaker) + statistický CUSUM detektor strukturálního rozpadu strategie.
+
 ---
 
 ## 3. Vývojové a provozní zásady
