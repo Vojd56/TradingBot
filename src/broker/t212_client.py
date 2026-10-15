@@ -177,3 +177,37 @@ class Trading212Client:
         """Zruší čekající objednávku podle jejího ID."""
         logger.info(f"Ruším objednávku ID {order_id} na brokerovi...")
         return self._request("DELETE", f"/api/v0/equity/orders/{order_id}")
+
+    def get_order_history(self, limit: int = 50, cursor: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Vrátí stránku historie exekuovaných a zrušených objednávek z Trading 212 API.
+        """
+        endpoint = f"/api/v0/equity/history/orders?limit={min(max(1, limit), 50)}"
+        if cursor:
+            endpoint += f"&cursor={cursor}"
+        res = self._request("GET", endpoint)
+        return res if isinstance(res, dict) else {}
+
+    def get_all_order_history(self, max_pages: int = 20) -> List[Dict[str, Any]]:
+        """
+        Načte kompletní historii objednávek z brokera přes stránkovací kurzor.
+        Každý prvek obsahuje { 'order': {...}, 'fill': {...} }.
+        """
+        import urllib.parse
+        all_orders: List[Dict[str, Any]] = []
+        cursor: Optional[str] = None
+        for _ in range(max_pages):
+            res = self.get_order_history(limit=50, cursor=cursor)
+            items = res.get("items", [])
+            if not items:
+                break
+            all_orders.extend(items)
+            next_path = res.get("nextPagePath")
+            if not next_path:
+                break
+            parsed = urllib.parse.urlparse(next_path)
+            qs = urllib.parse.parse_qs(parsed.query)
+            cursor = qs.get("cursor", [None])[0]
+            if not cursor:
+                break
+        return all_orders

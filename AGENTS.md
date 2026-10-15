@@ -65,3 +65,46 @@ Projekt obsahuje dva hlavní obchodní módy:
 * **Komunikace s uživatelem:** Výhradně v češtině.
 * **Bezpečnost kapitálu:** Demo režim na Trading 212 API jako výchozí stav.
 * **Zachování funkčnosti obou módů:** Úpravy v Day Traderu nesmí rozbít swingového bota a naopak.
+
+---
+
+## 4. Striktní zásady auditu, správy portfolia a zákaz halucinací (ZERO-TOLERANCE POLICY)
+
+### A) Zákaz halucinací a falšování dat
+* **Žádné vymyšlené metriky:** Nikdy neodhadovat, neinterpolovat ani negenerovat fiktivní P&L, nákupní/prodejní ceny ani zůstatky.
+* **Validace přes API:** Každý záznam v `trade memory` musí pocházet výhradně z oficiálního JSON výstupu brokera/burzy (`Order ID`, `Executed Price`, `Filled Qty`, `Fee`, `Timestamp`). Pokud chybí potvrzená exekuce z API, obchod NEEXISTUJE a nesmí být zapsán jako realizovaný.
+* **Důsledné oddělené účtování:**
+  - `Realized PnL` = (Prodejní cena − Nákupní vážená cena) × Množství − Poplatky (resp. oficiální `realisedProfitLoss` z broker API).
+  - Nikdy nezaměňovat celkový objem prodeje (Gross Value) za zisk (PnL).
+  - Vždy uvádět striktně odděleně: **Realized PnL**, **Unrealized PnL** a **Total Account Equity**.
+
+### B) Audit a verifikace historie (Trade Memory Reconciliation)
+* Před jakýmkoliv novým rozhodnutím porovnat stav lokální paměti se skutečným stavem na účtu přes API (`get_positions`, `get_account_cash`, `get_account_summary`, `get_all_order_history`).
+* Zjistí-li se nesoulad (např. v paměti je evidován fiktivní zisk, ale celkové portfolio kleslo):
+  1. Okamžitě označit chybný záznam jako `[INVALID/UNVERIFIED]`.
+  2. Provést rekalkulaci na základě skutečně spárovaných nákupních a prodejních příkazů z API brokera.
+  3. Upozornit uživatele na nalezenou odchylku s přesným rozpadem čísel.
+
+### C) Analýza nákupů a tržní strategie
+* **Fakta namísto spekulací:** Pracovat pouze s tvrdými tržními daty (volume, VWAP, support/resistance, funding rates) a doložitelnými fundamenty (oficiální zprávy, regulatorní hlášení).
+* **Risk Management:**
+  - Žádný nákup nesmí být proveden bez předem definovaného Stop-Lossu a kalkulace maximálního rizika na obchod s **R:R ratio minimálně 1:2**.
+  - Pokud je celkové portfolio ve ztrátě, prioritou je ochrana kapitálu (*capital preservation*), nikoliv agresivní ředění ztrátových pozic (*averaging down*).
+
+### D) Formát zápisu do paměti (Trade Log Schema)
+Každý uzavřený trade se zapisuje striktně v tomto formátu:
+```json
+{
+  "order_id": "STRING_FROM_BROKER",
+  "asset": "TICKER",
+  "direction": "BUY|SELL",
+  "execution_price": 0.00,
+  "quantity": 0.00,
+  "gross_amount": 0.00,
+  "fees": 0.00,
+  "realized_pnl": 0.00,
+  "realized_pnl_percent": 0.00,
+  "api_verified": true,
+  "notes": "Stručný faktický důvod vstupu/výstupu"
+}
+```

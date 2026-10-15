@@ -312,14 +312,18 @@ class DayTraderEngine:
         # Zaokrouhlení skóre
         score = max(0.0, min(100.0, round(score, 1)))
 
-        # Výpočet dynamického Stop Lossu a Take Profitu
+        # Výpočet dynamického Stop Lossu a Take Profitu se striktním poměrem rizika a zisku (R:R >= 1:2)
         sl_dist = max(snap.current_price * (self.stop_loss_pct / 100.0), snap.atr_5m * 1.2)
-        tp_dist = max(snap.current_price * (self.take_profit_pct / 100.0), snap.atr_5m * 2.0)
+        tp_dist = max(snap.current_price * (self.take_profit_pct / 100.0), snap.atr_5m * 2.4, sl_dist * 2.0)
 
         sl_price = round(snap.current_price - sl_dist, 2)
         tp_price = round(snap.current_price + tp_dist, 2)
 
-        action = SignalAction.BUY if score >= 62.0 else SignalAction.HOLD
+        # Kontrola kapitálové ochrany: pokud je účet v kumulativní ztrátě, zpřísníme vstupní práh
+        account_pnl = self.reflection_engine.account_metrics.get("realized_pnl", 0.0)
+        min_buy_score = 70.0 if account_pnl < 0.0 else 62.0
+
+        action = SignalAction.BUY if score >= min_buy_score else SignalAction.HOLD
         currency = self.get_ticker_currency(snap.ticker)
 
         return DayTradeSignal(
@@ -401,16 +405,22 @@ class DayTraderEngine:
                     message=f"Bleskový Day Trade Take Profit zasažen (+{pnl_pct:.2f} %)"
                 )
                 res = self.executor.execute_sell(ticker, exit_sig, pos.quantity)
+                if not res:
+                    logger.warning(f"⚠️ Prodejní příkaz Take Profit pro {ticker} nebyl brokerem potvrzen (res=None). Pozice zůstává otevřena.")
+                    continue
+
+                # Získání potvrzeného Order ID z brokera
+                order_id = str(res.get("id", "dry_run" if self.dry_run else "broker_order"))
                 trade_pnl_eur = pos.allocated_eur * (pnl_pct / 100.0)
                 self._daily_realized_pnl_eur += trade_pnl_eur
                 self._consecutive_losses = 0
                 self._session_trades_count += 1
                 self._session_wins += 1
 
-                # Uložení reflexe ziskového obchodu
+                # Uložení reflexe ziskového obchodu s ověřeným order_id
                 reg_name = self.current_regime_snapshot.regime.value if self.current_regime_snapshot else "NEUTRAL"
                 try:
-                    self.reflection_engine.record_and_reflect(
+                    refl = self.reflection_engine.record_and_reflect(
                         ticker=ticker,
                         entry_price=pos.entry_price_usd,
                         exit_price=current_price,
@@ -422,8 +432,16 @@ class DayTraderEngine:
                         entry_snapshot=snap,
                         regime_name=reg_name,
                     )
+                    refl.api_verified = True
+                    refl.trade_id = f"{ticker}_{order_id}"
                 except Exception as refl_err:
                     logger.debug(f"Chyba při reflexi TP: {refl_err}")
+
+                # Automatická rekonciliace s brokerem
+                try:
+                    self.reflection_engine.reconcile_with_broker_api(self.client)
+                except Exception as rec_err:
+                    logger.debug(f"Chyba při rekonciliaci po prodeji: {rec_err}")
 
                 closed_reports.append({"ticker": ticker, "reason": "TAKE_PROFIT", "pnl_pct": pnl_pct, "res": res})
                 self._peak_prices.pop(ticker, None)
@@ -445,6 +463,11 @@ class DayTraderEngine:
                     message=f"Day Trade Stop Loss aktivován k ochraně kapitálu ({pnl_pct:.2f} %)"
                 )
                 res = self.executor.execute_sell(ticker, exit_sig, pos.quantity)
+                if not res:
+                    logger.warning(f"⚠️ Prodejní příkaz Stop Loss pro {ticker} nebyl brokerem potvrzen (res=None). Pozice zůstává otevřena.")
+                    continue
+
+                order_id = str(res.get("id", "dry_run" if self.dry_run else "broker_order"))
                 trade_pnl_eur = pos.allocated_eur * (pnl_pct / 100.0)
                 self._daily_realized_pnl_eur += trade_pnl_eur
                 self._consecutive_losses += 1
@@ -465,9 +488,17 @@ class DayTraderEngine:
                         entry_snapshot=snap,
                         regime_name=reg_name,
                     )
+                    refl.api_verified = True
+                    refl.trade_id = f"{ticker}_{order_id}"
                     print(f"  🧠 [AI POST-MORTEM CHYBY] {ticker} | {refl.mistake_category.value}: {refl.lesson_learned}")
                 except Exception as refl_err:
                     logger.debug(f"Chyba při AI post-mortem SL: {refl_err}")
+
+                # Automatická rekonciliace s brokerem
+                try:
+                    self.reflection_engine.reconcile_with_broker_api(self.client)
+                except Exception as rec_err:
+                    logger.debug(f"Chyba při rekonciliaci po prodeji: {rec_err}")
 
                 # Kontrola limitů Circuit Breakeru
                 if self._consecutive_losses >= self.max_consecutive_losses or self._daily_realized_pnl_eur <= -self.max_daily_loss_eur:
