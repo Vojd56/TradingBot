@@ -1,5 +1,10 @@
 import logging
 import sys
+from pathlib import Path
+
+# Zajisteni importu z korene repozitare
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from src.data import MarketDataProvider
 from src.llm import LLMStockVerdict, SentimentEngine
 

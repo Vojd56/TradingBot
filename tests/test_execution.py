@@ -1,6 +1,10 @@
 import os
 import sys
 from pathlib import Path
+
+# Zajisteni importu z korene repozitare
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from config import settings
 from src.broker.t212_client import Trading212Client
 from src.execution import (

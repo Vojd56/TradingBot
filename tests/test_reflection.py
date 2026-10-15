@@ -1,5 +1,10 @@
+import sys
 from datetime import datetime
 from pathlib import Path
+
+# Zajisteni importu z korene repozitare
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from src.strategy.intraday_data import IntradaySnapshot
 from src.strategy.market_structure import MarketStructureAnalyzer
 from src.strategy.trade_reflection import (

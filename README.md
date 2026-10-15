@@ -106,41 +106,25 @@ python main.py --status
 # Nebo poklepáním na run_status.cmd
 ```
 
-### 2. Způsob 1: Dávkový / Plánovaný režim (Batch / Scheduled Mode)
-Ideální pro spouštění v konkrétní časy (např. přes Windows Task Scheduler v 16:30 a 21:00 CET):
-```powershell
-# Okamžitý jednorázový cyklus:
-python main.py --run-once --force
-# Nebo poklepáním na run_trading_bot.cmd
+### 2. Spouštěcí skripty (Windows .cmd)
 
-# Simulovaný běh bez skutečných příkazů (Dry Run):
-python main.py --run-once --dry-run --force
+Všechny hlavní provozní úlohy lze spustit jednoduše poklepáním na připravené `.cmd` soubory v kořenovém adresáři:
 
-# Běh s lokálním plánovačem pro konkrétní časy:
-python main.py --time "16:30,21:00"
-```
-
-### 3. Způsob 2: Nepřetržitý 24/7 Výzkumný a Obchodní Daemon (Continuous Intelligence & Live Trader)
-**Doporučený pokročilý režim:**
-1. **24/7 hloubkový výzkum na pozadí:** Vlákno výzkumu nepřetržitě prochází globální trhy, stahuje články, zprávy a fundamenty a nechává je analyzovat lokálním LLM na AMD Ryzen AI NPU. Žádný spěch ani časový stres.
-2. **Ukládání do Intelligence Cache:** Všechny syntézy a skóre se ukládají do `data/intelligence_cache.json`.
-3. **Blesková live exekuce:** V obchodních hodinách (Po–Pá 15:30–22:00 CET) bot okamžitě využívá předem zpracovaný výzkum z cache a exekuuje nákupy, prodeje a alfa rotace v řádu sekund za živé tržní ceny.
-```powershell
-# Spuštění 24/7 Daemona:
-python main.py --daemon
-# Nebo poklepáním na run_daemon.cmd
-
-# Kdykoliv zobrazit stav výzkumné cache (analyzované akcie, sentiment, katalyzátory):
-python main.py --research-status
-# Nebo poklepáním na run_research_status.cmd
-```
+| Skript | Funkce | Popis |
+|---|---|---|
+| **`run_daytrader.cmd`** | ⚡ **Day Trader (Hlavní)** | 5min svíčky, VWAP, EMA Ribbon, dynamické ATR, až 15 pozic na pákových ETF a akciích |
+| **`run_market_scanner.cmd`** | 🔍 **Okamžitý Skener & Rada AI** | Okamžitý hloubkový průzkum trhu a konsenzuální schválení Radou 3 AI modelů |
+| **`run_scheduled_scanner.cmd`** | ⏰ **Plánovač Skeneru** | Automatický sken 2x denně (09:30 CET Evropa a 16:00 CET USA) |
+| **`run_trade_memory.cmd`** | 🧠 **Paměť chyb & Zkušenosti** | Přehled post-mortem analýz, ponaučení a bezpečnostních pravidel (FinMem) |
+| **`run_status.cmd`** | 📊 **Stav účtu a pozic** | Bleskový výpis zůstatku účtu Trading 212 a otevřených pozic |
+| **`run_daemon.cmd`** | 🐢 **Swing / Value Bot** | Konzervativní 24/7 výzkumný daemon (denní svíčky, NPU fundamenty) |
 
 ---
 
 ## 🧪 Testovací sada
 
-Projekt obsahuje samostatné verifikační testy pro jednotlivé vrstvy:
-- `python test.py` – Test datové vrstvy yfinance, RSI, ATR a zpráv
-- `python test_llm.py` – Test sanitizace JSONu a propojení s NPU modelem
-- `python test_strategy.py` – Test risk managementu, ATR stops a kvantitativního scoringu
-- `python test_execution.py` – Test mapování tickerů a synchronizace s Trading 212 Demo API
+Jednotkové a integrační testy jsou organizovány v adresáři `tests/`:
+- `python tests/test_reflection.py` – Test tržní struktury (Turtle Soup, VWAP přepálení) a paměti chyb
+- `python tests/test_strategy.py` – Test risk managementu, ATR stops a kvantitativního scoringu
+- `python tests/test_execution.py` – Test mapování tickerů a správy portfolia
+- `python tests/test_llm.py` – Test sanitizace JSON výstupů z lokálního LLM

@@ -1,4 +1,9 @@
 import sys
+from pathlib import Path
+
+# Zajisteni importu z korene repozitare
+sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
+
 from src.data.market_data import TechnicalMetrics
 from src.llm.sentiment_engine import LLMStockVerdict
 from src.strategy import (
