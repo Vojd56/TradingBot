@@ -689,9 +689,12 @@ class DayTraderEngine:
                     else:
                         print(f"Aktuálně nejsou otevřeny žádné pozice (Kapacita: {self.max_active_positions} volných slotů).")
 
-                    print("\nTop intradenní momentum signály:")
                     signals.sort(key=lambda s: s.score, reverse=True)
-                    for s in signals[:8]:
+                    buy_signals = [s for s in signals if s.action == SignalAction.BUY]
+                    hold_signals = [s for s in signals if s.action != SignalAction.BUY]
+                    print(f"\nTop intradenní momentum signály (z celkem {len(signals)} skenovaných: {len(buy_signals)}x BUY, {len(hold_signals)}x HOLD):")
+                    display_signals = (buy_signals + hold_signals[:max(0, 10 - len(buy_signals))])[:12]
+                    for s in display_signals:
                         above_str = "NAD VWAP ▲" if (s.current_price > s.vwap) else "POD VWAP ▼"
                         market_open = MarketHours.is_ticker_market_open(s.ticker)
                         market_note = "" if market_open else " (🌙 Burza zavřena)"
@@ -702,6 +705,9 @@ class DayTraderEngine:
                             f"Cena: {s.current_price:7.2f} {curr} ({above_str}) | "
                             f"5m RSI: {s.rsi_5m:4.1f} | Objem: {s.volume_surge:3.1f}x"
                         )
+                    if len(signals) > len(display_signals):
+                        remaining_count = len(signals) - len(display_signals)
+                        print(f"  ... a dalších {remaining_count} titulů v režimu HOLD (skóre pod nákupním prahem 62 b)")
                     print(f"Příští sken za {scan_interval_seconds} sekund...\n")
 
                 else:
