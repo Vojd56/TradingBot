@@ -34,7 +34,7 @@ def test_risk_manager_logic():
     print("  [OK] Dynamická conviction alokace (Tier 1: 21.67 EUR, Tier 2: 16.67 EUR, Tier 3: 10.84 EUR) a limit pozic fungují správně.")
 
     # 3. Přepočet frakčních akcií (EUR -> USD)
-    shares = rm.calculate_shares_quantity(allocated_eur=16.67, stock_price_usd=228.0, eur_usd_rate=1.08)
+    shares = rm.calculate_shares_quantity(allocated_eur=16.67, stock_price=228.0, eur_usd_rate=1.08)
     assert shares > 0, "Počet akcií musí být kladný"
     print(f"  [OK] Frakční akcie pro 16.67 EUR při ceně 228 USD: {shares} ks")
 

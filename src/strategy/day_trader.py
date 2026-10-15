@@ -15,7 +15,9 @@ from src.strategy.autonomous_discovery import AutonomousDiscoveryEngine
 from src.strategy.intraday_data import IntradayDataProvider, IntradaySnapshot
 from src.strategy.macro_regime import MarketRegime, MarketRegimeDetector, RegimeSnapshot
 from src.strategy.market_hours import MarketHours
+from src.strategy.market_structure import MarketStructureAnalyzer, MarketStructureSnapshot
 from src.strategy.models import ExitReason, PositionExitSignal, SignalAction, TradingSignal
+from src.strategy.trade_reflection import TradeReflectionEngine, TradeReflectionRecord, TradeMistakeCategory
 from config import settings
 
 logger = logging.getLogger(__name__)
@@ -175,6 +177,15 @@ class DayTraderEngine:
         self.max_daily_loss_eur = max_daily_loss_eur
         self.max_consecutive_losses = max_consecutive_losses
 
+        # Moduly tržní struktury a sebereflexe chyb (FinMem / Minervini principy)
+        self.market_structure = MarketStructureAnalyzer()
+        self.reflection_engine = TradeReflectionEngine(sentiment_engine=self.sentiment_engine)
+        try:
+            from pathlib import Path
+            self.reflection_engine.bootstrap_from_portfolio_history(Path("data/portfolio_state.json"))
+        except Exception as boot_err:
+            logger.debug(f"Chyba při bootstrapu paměti z portfolia: {boot_err}")
+
         # Sledování stavu obchodu a statistik seance (inspirováno DavidTech / Kevin Davey pravidly)
         self._peak_prices: Dict[str, float] = {}
         self._breakeven_applied: Set[str] = set()
@@ -293,6 +304,11 @@ class DayTraderEngine:
             score += 15.0
             reasons.append("Proražení 30minutového lokálního maxima")
 
+        # 6. Analýza tržní struktury (Liquidity Sweeps, VWAP overextension, ranní okno, páka)
+        struct = self.market_structure.analyze_snapshot(snap)
+        score += struct.score_adjustment
+        reasons.extend(struct.reasons)
+
         # Zaokrouhlení skóre
         score = max(0.0, min(100.0, round(score, 1)))
 
@@ -390,6 +406,25 @@ class DayTraderEngine:
                 self._consecutive_losses = 0
                 self._session_trades_count += 1
                 self._session_wins += 1
+
+                # Uložení reflexe ziskového obchodu
+                reg_name = self.current_regime_snapshot.regime.value if self.current_regime_snapshot else "NEUTRAL"
+                try:
+                    self.reflection_engine.record_and_reflect(
+                        ticker=ticker,
+                        entry_price=pos.entry_price_usd,
+                        exit_price=current_price,
+                        pnl_pct=pnl_pct,
+                        allocated_eur=pos.allocated_eur,
+                        exit_reason="TAKE_PROFIT",
+                        entry_time=getattr(pos, "entry_date", None),
+                        exit_time=datetime.now().isoformat(),
+                        entry_snapshot=snap,
+                        regime_name=reg_name,
+                    )
+                except Exception as refl_err:
+                    logger.debug(f"Chyba při reflexi TP: {refl_err}")
+
                 closed_reports.append({"ticker": ticker, "reason": "TAKE_PROFIT", "pnl_pct": pnl_pct, "res": res})
                 self._peak_prices.pop(ticker, None)
                 self._breakeven_applied.discard(ticker)
@@ -414,6 +449,25 @@ class DayTraderEngine:
                 self._daily_realized_pnl_eur += trade_pnl_eur
                 self._consecutive_losses += 1
                 self._session_trades_count += 1
+
+                # AI Post-Mortem rozbor chyby na AMD NPU a uložení ponaučení do paměti
+                reg_name = self.current_regime_snapshot.regime.value if self.current_regime_snapshot else "NEUTRAL"
+                try:
+                    refl = self.reflection_engine.record_and_reflect(
+                        ticker=ticker,
+                        entry_price=pos.entry_price_usd,
+                        exit_price=current_price,
+                        pnl_pct=pnl_pct,
+                        allocated_eur=pos.allocated_eur,
+                        exit_reason="STOP_LOSS",
+                        entry_time=getattr(pos, "entry_date", None),
+                        exit_time=datetime.now().isoformat(),
+                        entry_snapshot=snap,
+                        regime_name=reg_name,
+                    )
+                    print(f"  🧠 [AI POST-MORTEM CHYBY] {ticker} | {refl.mistake_category.value}: {refl.lesson_learned}")
+                except Exception as refl_err:
+                    logger.debug(f"Chyba při AI post-mortem SL: {refl_err}")
 
                 # Kontrola limitů Circuit Breakeru
                 if self._consecutive_losses >= self.max_consecutive_losses or self._daily_realized_pnl_eur <= -self.max_daily_loss_eur:
@@ -474,6 +528,23 @@ class DayTraderEngine:
 
         for sig in tradeable_buys[:available_slots]:
             curr = getattr(sig, "currency", self.get_ticker_currency(sig.ticker))
+
+            # --- 🧠 PROVĚŘENÍ PAMĚTI CHYB (Trade Reflection Memory Check) ---
+            mem_check = self.reflection_engine.check_candidate_against_memory(
+                ticker=sig.ticker,
+                current_price=sig.current_price,
+                rsi_5m=sig.rsi_5m,
+                vwap=sig.vwap,
+                score=sig.score,
+            )
+            if not mem_check.get("approved", True):
+                mem_veto = (
+                    f"  🚫 [PAMĚŤ CHYB - VETO] {sig.ticker} | "
+                    f"{mem_check.get('reason')} | Nákup zrušen!"
+                )
+                logger.warning(mem_veto)
+                print(mem_veto)
+                continue
 
             # --- 🤖 BLESKOVÝ AI RISK CHECK (AMD NPU / Lemonade Server) ---
             headlines: List[str] = []
@@ -645,6 +716,9 @@ class DayTraderEngine:
         print(f"  Těsný Stop Loss:      -{self.stop_loss_pct:.1f} % (nebo 1.2x ATR)")
         print(f"  Breakeven Stop:       Aktivní při zisku +{self.breakeven_trigger_pct:.1f} %")
         print(f"  Circuit Breaker:      Stop po {self.max_consecutive_losses} ztrátách nebo -{self.max_daily_loss_eur:.0f} EUR ztráty")
+        ref_cnt = len(self.reflection_engine.reflections)
+        print(f"  AI Paměť & Reflexe:   AKTIVNÍ ({ref_cnt} analyzovaných obchodů v paměti chyb)")
+        print(f"  Tržní struktura:      AKTIVNÍ (Detekce Liquidity Sweeps, VWAP přepětí a otevíracího okna)")
         print(f"  AI Validátor (NPU):   AKTIVNÍ (Lemonade NPU provádí bleskový sanity check zpráv)")
         print(f"  Režim:                {'DRY-RUN (Simulace)' if self.dry_run else 'LIVE EXEKUCE (Demo účet)'}")
         print("=" * 70 + "\n")

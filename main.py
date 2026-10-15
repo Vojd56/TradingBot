@@ -40,6 +40,7 @@ from src.strategy.day_trader import DayTraderEngine
 from src.strategy.intelligence_cache import IntelligenceCache
 from src.strategy.market_hours import MarketHours
 from src.strategy.scheduled_scanner import ScheduledMarketScanner
+from src.strategy.trade_reflection import TradeReflectionEngine
 
 # Vytvoření adresáře pro logy a reporty
 LOGS_DIR = Path("logs")
@@ -360,6 +361,39 @@ class TradingBotApp:
         except Exception as exc:
             print(f"Chyba při čtení schválených příležitostí: {exc}")
 
+    def show_trade_memory(self) -> None:
+        """Zobrazí uloženou paměť sebereflexe chyb (Trade Reflection Memory)."""
+        self.print_banner()
+        print("=== 🧠 AI PAMĚŤ CHYB & SEBEREFLEXE (TRADE REFLECTION MEMORY) ===")
+        engine = TradeReflectionEngine(sentiment_engine=self.sentiment_engine)
+        engine.bootstrap_from_portfolio_history(Path("data/portfolio_state.json"))
+
+        refls = engine.reflections
+        if not refls:
+            print("V paměti zatím nejsou žádné zaznamenané obchody.\n")
+            return
+
+        total = len(refls)
+        wins = sum(1 for r in refls if r.pnl_pct > 0)
+        losses = sum(1 for r in refls if r.pnl_pct <= 0)
+        total_pnl = sum(r.pnl_eur for r in refls)
+        win_rate = (wins / total * 100.0) if total > 0 else 0.0
+
+        print(f"Celkem analyzováno obchodů: {total}")
+        print(f"Ziskové / Ztrátové:          {wins} / {losses} (Win Rate: {win_rate:.1f} %)")
+        print(f"Celkový realizovaný zisk:    {total_pnl:+.2f} EUR\n")
+
+        print(f"{'Ticker':<7} | {'Výsledek':<11} | {'Důvod':<12} | {'Kategorie / Chyba':<26} | {'Ponaučení (Lesson Learned)'}")
+        print("-" * 115)
+        for r in refls[-15:]:
+            pnl_str = f"{r.pnl_pct:+.2f} %"
+            badge = f"🟢 {pnl_str}" if r.pnl_pct > 0 else f"🔴 {pnl_str}"
+            cat = r.mistake_category.value[:25]
+            print(
+                f"{r.ticker:<7} | {badge:<11} | {r.exit_reason:<12} | {cat:<26} | {r.lesson_learned[:50]}"
+            )
+        print("\n")
+
     def evaluate_committee_ticker(self, ticker: str) -> None:
         """Provede detailní oponenturu Rady AI pro jeden konkrétní titul."""
         self.print_banner()
@@ -544,6 +578,13 @@ def main():
         help="Provede detailní oponenturu a ověření pravdivosti v Radě AI pro jeden konkrétní titul (např. --committee NVDA).",
     )
     parser.add_argument(
+        "--trade-memory",
+        "--lessons",
+        action="store_true",
+        dest="trade_memory",
+        help="Zobrazí paměť sebereflexe chyb, win rate a ponaučení z minulých obchodů (data/trade_memory.json).",
+    )
+    parser.add_argument(
         "--force",
         action="store_true",
         help="Vynutí spuštění cyklu i o víkendu při --run-once.",
@@ -564,6 +605,8 @@ def main():
         app.schedule_market_scans()
     elif args.scanner_status:
         app.show_scanner_status()
+    elif args.trade_memory:
+        app.show_trade_memory()
     elif args.committee:
         app.evaluate_committee_ticker(args.committee)
     elif args.status:

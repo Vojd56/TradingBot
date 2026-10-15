@@ -45,6 +45,20 @@ Projekt obsahuje dva hlavní obchodní módy:
   - **Ověření pravdivosti & Konsenzus:** Nákup je schválen pouze při jednohlasné (`UNANIMOUS`) nebo většinové (`MAJORITY`) shodě. Pokud skeptik zjistí kritické riziko (`VETO_TRIGGERED`) nebo panuje neshoda (`SPLIT_DECISION`), obchod je zablokován pro ochranu kapitálu.
   - Schválené příležitosti se ukládají do `data/qualified_opportunities.json`, odkud si je Day Trader bleskově načítá pro exekuci.
 
+### D) Samoučící se paměť chyb (Trade Reflection) & Tržní struktura (FinMem & Minervini)
+* **Spuštění přehledu paměti:** `python main.py --trade-memory` nebo skript `run_trade_memory.cmd`
+* **Perzistentní paměť:** `data/trade_memory.json`
+* **Princip fungování (FinMem architektura):**
+  - Po uzavření každého obchodu (zejména na Stop Lossu) lokální model `Qwen2.5-7B` provede automatický **Post-Mortem rozbor**:
+    - Kategorizuje chybu (`OPENING_VOLATILITY_CHOP`, `OVERBOUGHT_RSI`, `VWAP_OVEREXTENSION`, `LIQUIDITY_SWEEP_FAKEOUT`, `COUNTER_TREND_FIGHT`, atd.).
+    - Zformuluje konkrétní ponaučení (*Lesson Learned*) a preventivní pravidlo.
+  - **Aktivní ochrana před opakováním chyb:** Před každým dalším nákupem Day Trader prověří paměť. Pokud by se chystal opakovat stejnou chybu u daného instrumentu, vystaví **VETO**.
+* **Kvantitativní tržní struktura (`MarketStructureAnalyzer`):**
+  - **Liquidity Sweeps (Turtle Soup):** Penalizuje nákupy na samotném vrcholu falešného breakoutu při vyčerpaném RSI a objemu.
+  - **VWAP Overextension:** Zabraňuje honění ceny příliš daleko nad VWAPem.
+  - **Otevírací okno:** Chrání před ranními whip-saws v prvních 15 minutách po otevření burzy.
+  - **Páková ETF:** Počítá volatilitní rozpad (*volatility drag*) pro 2x/3x ETF.
+
 ---
 
 ## 3. Vývojové a provozní zásady
