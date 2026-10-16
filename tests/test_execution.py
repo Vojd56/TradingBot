@@ -20,9 +20,12 @@ def test_ticker_mapper():
     print("\n--- [1] Test Ticker Mappera ---")
     assert TickerMapper.to_t212_ticker("NVDA") == "NVDA_US_EQ"
     assert TickerMapper.to_t212_ticker("AAPL") == "AAPL_US_EQ"
-    assert TickerMapper.to_t212_ticker("BRK-B") == "BRKb_US_EQ"
+    assert TickerMapper.to_t212_ticker("BRK-B") == "BRK_B_US_EQ"
+    assert TickerMapper.to_t212_ticker("TTE.PA") == "FPp_EQ"
     assert TickerMapper.to_standard_ticker("NVDA_US_EQ") == "NVDA"
+    assert TickerMapper.to_standard_ticker("BRK_B_US_EQ") == "BRK-B"
     assert TickerMapper.to_standard_ticker("BRKb_US_EQ") == "BRK-B"
+    assert TickerMapper.to_standard_ticker("FPp_EQ") == "TTE.PA"
     print("  [OK] Obousměrný převod tickerů a speciálních případů funguje bezchybně.")
 
 
@@ -287,6 +290,31 @@ def test_trading212_client_compatibility_methods():
         assert mock_orders[-1]["ticker"] == "MSFT_US_EQ"
         assert mock_orders[-1]["quantity"] == -5.0
         print("  [OK] Trading212Client place_order správně transformuje tickery i polaritu pro BUY/SELL.")
+
+        # 3. Test automatického zotavení při quantity-precision-mismatch
+        calls = []
+
+        def fake_request(method, endpoint, json_data=None, params=None):
+            calls.append(json_data)
+            if json_data and json_data.get("quantity") == 0.4418:
+                from src.broker.t212_client import Trading212APIError
+                raise Trading212APIError(
+                    status_code=400,
+                    message='{"type":"/api-errors/quantity-precision-mismatch","detail":"invalid quantity precision 3"}',
+                )
+            return {"id": "RETRY_PRECISION_OK", "quantity": json_data.get("quantity") if json_data else None}
+
+        orig_request = client._request
+        client._request = fake_request
+        client.place_market_order = original_method  # obnovit reálnou metodu
+        try:
+            res_prec = client.place_market_order("RIOl_EQ", 0.4418)
+            assert res_prec["id"] == "RETRY_PRECISION_OK"
+            assert res_prec["quantity"] == 0.442
+            assert len(calls) == 2
+            print("  [OK] Trading212Client place_market_order automaticky zotavil quantity-precision-mismatch na 3 desetinná místa (0.442).")
+        finally:
+            client._request = orig_request
     finally:
         client.place_market_order = original_method
 

@@ -12,11 +12,24 @@ class TickerMapper:
 
     # Manuální výjimky pro tickery se speciálními znaky a evropské burzy
     SPECIAL_MAPPINGS: Dict[str, str] = {
-        "BRK-B": "BRKb_US_EQ",
-        "BRK.B": "BRKb_US_EQ",
+        "BRK-B": "BRK_B_US_EQ",
+        "BRK.B": "BRK_B_US_EQ",
         "BF-B": "BFb_US_EQ",
         "BF.B": "BFb_US_EQ",
+        # Speciální a historické symboly na Trading 212
+        "META": "FB_US_EQ",
+        "SONY": "SNE_US_EQ",
+        "RTX": "UTX_US_EQ",
+        "SE": "GARENA_US_EQ",
+        "HEI": "HEICO_US_EQ",
         # Evropské tituly na Trading 212
+        "SUNB": "AHTl_EQ",
+        "SUNB.L": "AHTl_EQ",
+        "ABBN.SW": "ABBNsEQ",
+        "ABBN": "ABBNsEQ",
+        "RO.SW": "ROGs_EQ",
+        "ROG.SW": "ROGs_EQ",
+        "RO": "ROGs_EQ",
         "RHM.DE": "RHMd_EQ",
         "RHM": "RHMd_EQ",
         "RR.L": "RRl_EQ",
@@ -24,15 +37,13 @@ class TickerMapper:
         "SMSN.IL": "SMSNl_EQ",
         "SMSN.L": "SMSNl_EQ",
         "SMSN": "SMSNl_EQ",
-        "SUNB": "SUNB_US_EQ",
-        "SUNB.L": "SUNBl_EQ",
         "SAP.DE": "SAPd_EQ",
         "NOVO-B.CO": "NOVCd_EQ",
         "NESN.SW": "NESNs_EQ",
         "NESN": "NESNs_EQ",
         "ASML.AS": "ASMLa_EQ",
-        "TTE.PA": "TTEp_EQ",
-        "TTE": "TTEp_EQ",
+        "TTE.PA": "FPp_EQ",
+        "TTE": "FPp_EQ",
         "AIR.PA": "AIRp_EQ",
         "AIR": "AIRp_EQ",
         "RIO.L": "RIOl_EQ",
@@ -40,19 +51,27 @@ class TickerMapper:
     }
 
     REVERSE_SPECIAL: Dict[str, str] = {
+        "BRK_B_US_EQ": "BRK-B",
         "BRKb_US_EQ": "BRK-B",
         "BFb_US_EQ": "BF-B",
+        "FB_US_EQ": "META",
+        "SNE_US_EQ": "SONY",
+        "UTX_US_EQ": "RTX",
+        "GARENA_US_EQ": "SE",
+        "HEICO_US_EQ": "HEI",
+        "AHTl_EQ": "SUNB",
+        "ABBNsEQ": "ABBN.SW",
+        "ROGs_EQ": "RO.SW",
+        "FPp_EQ": "TTE.PA",
+        "TTEp_EQ": "TTE.PA",
         "RHMd_EQ": "RHM.DE",
         "RRl_EQ": "RR.L",
         "RYCEY_US_EQ": "RYCEY",
         "SMSNl_EQ": "SMSN.IL",
-        "SUNB_US_EQ": "SUNB",
-        "SUNBl_EQ": "SUNB.L",
         "SAPd_EQ": "SAP.DE",
         "NOVCd_EQ": "NOVO-B.CO",
         "NESNs_EQ": "NESN.SW",
         "ASMLa_EQ": "ASML.AS",
-        "TTEp_EQ": "TTE.PA",
         "AIRp_EQ": "AIR.PA",
         "RIOl_EQ": "RIO.L",
     }
@@ -64,8 +83,8 @@ class TickerMapper:
         Např.: 'NVDA' -> 'NVDA_US_EQ', 'BRK-B' -> 'BRKb_US_EQ'.
         """
         raw = standard_ticker.strip()
-        # Pokud již obsahuje příponu, vrátíme beze změny (zachováme původní velikost písmen jako SMSNl_EQ)
-        if raw.endswith("_US_EQ") or raw.endswith("_EQ"):
+        # Pokud již obsahuje příponu, vrátíme beze změny (zachováme původní velikost písmen jako SMSNl_EQ či ABBNsEQ)
+        if raw.endswith("_US_EQ") or raw.endswith("_EQ") or raw == "ABBNsEQ":
             return raw
 
         clean = raw.upper()

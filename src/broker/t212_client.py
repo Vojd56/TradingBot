@@ -194,7 +194,8 @@ class Trading212Client:
         self,
         ticker: str,
         quantity: float,
-        extended_hours: bool = False
+        extended_hours: bool = False,
+        _precision_retry: bool = False,
     ) -> Dict[str, Any]:
         """
         Zadá nákupní nebo prodejní market příkaz.
@@ -211,7 +212,30 @@ class Trading212Client:
             payload["extendedHours"] = True
 
         logger.info(f"Odesílám market order: {ticker} | množství: {quantity}")
-        return self._request("POST", "/api/v0/equity/orders/market", json_data=payload)
+        try:
+            return self._request("POST", "/api/v0/equity/orders/market", json_data=payload)
+        except Trading212APIError as exc:
+            # Automatické zotavení při chybě quantity-precision-mismatch
+            if not _precision_retry and ("quantity-precision-mismatch" in str(exc) or "invalid quantity precision" in str(exc)):
+                import re
+                m = re.search(r"invalid quantity precision\s*(\d+)", str(exc))
+                if m:
+                    allowed_prec = int(m.group(1))
+                    new_qty = round(quantity, allowed_prec)
+                    if allowed_prec == 0:
+                        new_qty = float(round(quantity))
+                    if new_qty != 0:
+                        logger.warning(
+                            f"Quantity precision mismatch pro {ticker} (původní: {quantity}). "
+                            f"Automaticky upravuji na {allowed_prec} desetinných míst ({new_qty}) a opakuji příkaz."
+                        )
+                        return self.place_market_order(
+                            ticker=ticker,
+                            quantity=new_qty,
+                            extended_hours=extended_hours,
+                            _precision_retry=True,
+                        )
+            raise
 
     def get_open_orders(self) -> List[Dict[str, Any]]:
         """Vrátí všechny čekající (nevyplněné) objednávky."""

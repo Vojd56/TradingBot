@@ -164,12 +164,20 @@ class ExecutionEngine:
 
         broker_ticker = self.ticker_mapper.to_t212_ticker(ticker)
 
+        # Výchozí zaokrouhlení: UK akcie (LSE - l_EQ) povolují max 3 desetinná místa, US 4
+        precision = 3 if broker_ticker.endswith("l_EQ") else 4
+        order_qty = round(qty, precision) if side == OrderSide.BUY else -abs(round(qty, precision))
+
+        if abs(order_qty) == 0:
+            logger.info(f"{ticker}: Zaokrouhlené množství po aplikaci přesnosti ({precision}) je 0, přeskakuji exekuci.")
+            return None
+
         order = ExecutionOrder(
             client_order_id=client_order_id,
             ticker=ticker,
             broker_ticker=broker_ticker,
             side=side,
-            quantity=round(qty, 4),
+            quantity=abs(order_qty),
             limit_price=None,  # Market order pro okamžité plnění
             stop_loss_price=barriers.stop_loss_price if side == OrderSide.BUY else None,
             take_profit_price=barriers.take_profit_price if side == OrderSide.BUY else None,
@@ -182,7 +190,6 @@ class ExecutionEngine:
         # Exekuce u brokera (pokud je live režim a máme klienta)
         if self.is_live and self.client:
             try:
-                order_qty = round(qty, 4) if side == OrderSide.BUY else -abs(round(qty, 4))
                 resp = self.client.place_order(
                     ticker=broker_ticker,
                     quantity=order_qty,
