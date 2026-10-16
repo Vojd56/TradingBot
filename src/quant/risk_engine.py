@@ -64,6 +64,47 @@ class CarverRiskEngine:
         self.max_correlation_threshold = max_correlation_threshold
         self.hard_correlation_threshold = hard_correlation_threshold
 
+    @staticmethod
+    def get_ticker_currency(ticker: str) -> str:
+        """Určí nativní kótovací měnu instrumentu podle přípony tickeru."""
+        clean = ticker.upper().strip()
+        if clean.endswith(".L") or clean.endswith(".IL"):
+            if clean in ("SMSN.IL", "SMSN.L"):
+                return "USD"
+            return "GBp"
+        if clean.endswith(".DE") or clean.endswith(".PA") or clean.endswith(".AS"):
+            return "EUR"
+        if clean.endswith(".SW"):
+            return "CHF"
+        return "USD"
+
+    @classmethod
+    def get_share_price_usd(
+        cls,
+        ticker: str,
+        raw_price: float,
+        fx_rates: Optional[Dict[str, float]] = None
+    ) -> float:
+        """
+        Převede surovou cenu akcie z yfinance (která může být v GBp, EUR, CHF nebo USD) na USD.
+        """
+        if raw_price <= 0:
+            return 0.0
+
+        curr = cls.get_ticker_currency(ticker)
+        rates = fx_rates or {"EUR": 1.08, "GBP": 1.30, "CHF": 1.12, "USD": 1.0}
+
+        if curr == "GBp":
+            # Pence na LSE: 100 pence = 1 GBP
+            gbp_rate = rates.get("GBP", 1.30)
+            return (raw_price / 100.0) * gbp_rate
+        elif curr == "EUR":
+            return raw_price * rates.get("EUR", 1.08)
+        elif curr == "CHF":
+            return raw_price * rates.get("CHF", 1.12)
+
+        return raw_price
+
     def calculate_position_size(
         self,
         ev_result: ExpectedValueResult,
@@ -73,14 +114,20 @@ class CarverRiskEngine:
         current_shares: float = 0.0,
         available_cash: Optional[float] = None,
         correlation_penalty_multiplier: float = 1.0,
+        fx_rates: Optional[Dict[str, float]] = None,
     ) -> PositionSizingResult:
         """
         Vypočte optimální velikost pozice podle Carverova Volatility Targetingu s 10% pásmem nečinnosti.
+        Veškeré finanční výpočty (ekvita, hotovost, risk) probíhají v USD; ceny neamerických akcií (EUR, GBp, CHF)
+        jsou normalizovány přes live FX kurzy.
         """
         ticker = ev_result.ticker
-        curr_price = features.current_price
+        raw_price = features.current_price
+        share_price_usd = self.get_share_price_usd(ticker, raw_price, fx_rates)
+        if share_price_usd <= 0:
+            share_price_usd = raw_price
 
-        if portfolio_equity <= 0 or curr_price <= 0:
+        if portfolio_equity <= 0 or raw_price <= 0:
             return PositionSizingResult(
                 ticker=ticker,
                 target_shares=0.0,
@@ -114,26 +161,26 @@ class CarverRiskEngine:
         target_annual_vol = self.base_annual_target_vol * regime.risk_multiplier
         daily_target_vol = target_annual_vol / math.sqrt(252)
 
-        # 2. Celková denní peněžní volatilita portfolia (Daily Cash Volatility Target)
+        # 2. Celková denní peněžní volatilita portfolia v USD (Daily Cash Volatility Target)
         total_daily_cash_vol = portfolio_equity * daily_target_vol
 
-        # 3. Peněžní volatilita alokovaná na 1 pozici
+        # 3. Peněžní volatilita alokovaná na 1 pozici v USD
         position_daily_cash_vol = total_daily_cash_vol / math.sqrt(self.target_positions_count)
 
-        # 4. Denní volatilita 1 kusu instrumentu: ATR_20
-        # Použijeme ATR_20 (v absolutní měně na akcii)
-        instrument_daily_vol_per_share = max(0.01, features.atr_20)
+        # 4. Denní volatilita 1 kusu instrumentu v USD (ATR_20 normalizovaná do USD)
+        raw_atr_20 = max(0.01, features.atr_20)
+        atr_20_usd = (raw_atr_20 / raw_price) * share_price_usd if raw_price > 0 else raw_atr_20
+        instrument_daily_vol_per_share_usd = max(0.01, atr_20_usd)
 
         # 5. Nekonstrainovaný počet kusů (Carverův základní vzorec)
-        unconstrained_shares = position_daily_cash_vol / instrument_daily_vol_per_share
+        unconstrained_shares = position_daily_cash_vol / instrument_daily_vol_per_share_usd
 
         # Aplikace korelační penalizace (pokud má titul vysokou korelaci s existujícím portfoliem)
         unconstrained_shares *= correlation_penalty_multiplier
 
-        # 6. Aplikace Half-Kelly a koncentračních stropů
-        # Max alokace na 1 pozici v kapitálu
+        # 6. Aplikace Half-Kelly a koncentračních stropů (v USD)
         max_allowed_value = portfolio_equity * (self.max_position_weight_pct / 100.0)
-        target_value_initial = unconstrained_shares * curr_price
+        target_value_initial = unconstrained_shares * share_price_usd
 
         capped_value = min(target_value_initial, max_allowed_value)
 
@@ -146,8 +193,8 @@ class CarverRiskEngine:
             # Přepočet velikosti pozice podle maximálního přípustného Stop Loss rizika
             capped_value = max_allowed_loss_cash / max(1e-4, sl_pct)
 
-        target_shares = capped_value / curr_price
-        target_value = round(target_shares * curr_price, 2)
+        target_shares = capped_value / share_price_usd
+        target_value = round(target_shares * share_price_usd, 2)
         portfolio_weight = round((target_value / portfolio_equity) * 100.0, 2)
         risk_cash = round(target_value * sl_pct, 2)
         risk_pct = round((risk_cash / portfolio_equity) * 100.0, 2)
@@ -155,13 +202,17 @@ class CarverRiskEngine:
         # 8. Rozdíl a Carverovo 10% pásmo nečinnosti (Inertia Buffer)
         shares_diff = target_shares - current_shares
 
-        # Omezení nového nákupu dostupnou hotovostí (hotovost omezuje pouze přírůstek, nikdy nenutí prodávat)
+        # Omezení nového nákupu dostupnou hotovostí (v USD)
         if shares_diff > 0 and available_cash is not None:
-            max_buy_cash = max(0.0, available_cash * 0.98)
-            max_add_shares = max_buy_cash / curr_price
+            max_buy_cash = max(0.0, available_cash * 0.90)
+            max_add_shares = max_buy_cash / share_price_usd
             if shares_diff > max_add_shares:
                 shares_diff = max_add_shares
                 target_shares = current_shares + shares_diff
+                target_value = round(target_shares * share_price_usd, 2)
+                portfolio_weight = round((target_value / portfolio_equity) * 100.0, 2)
+                risk_cash = round(target_value * sl_pct, 2)
+                risk_pct = round((risk_cash / portfolio_equity) * 100.0, 2)
 
         # Pro Long-Only prodeje: nikdy neprodávat více, než je aktuálně vlastněno
         if shares_diff < 0:
@@ -172,21 +223,22 @@ class CarverRiskEngine:
                 shares_diff = -current_shares
                 target_shares = 0.0
 
-        # Minimální smysluplná velikost obchodu (prachové obchody pod $2 vynechat)
-        if abs(shares_diff) * curr_price < 2.0:
+        # Minimální smysluplná velikost obchodu (prachové obchody pod $10 vynechat)
+        if abs(shares_diff) * share_price_usd < 10.0:
             return PositionSizingResult(
                 ticker=ticker,
                 target_shares=round(current_shares, 4),
-                target_value=round(current_shares * curr_price, 2),
-                portfolio_weight_pct=round((current_shares * curr_price / portfolio_equity) * 100.0, 2),
-                risk_per_trade_cash=round(current_shares * curr_price * sl_pct, 2),
-                risk_per_trade_pct=round((current_shares * curr_price * sl_pct / portfolio_equity) * 100.0, 2),
+                target_value=round(current_shares * share_price_usd, 2),
+                portfolio_weight_pct=round((current_shares * share_price_usd / portfolio_equity) * 100.0, 2),
+                risk_per_trade_cash=round(current_shares * share_price_usd * sl_pct, 2),
+                risk_per_trade_pct=round((current_shares * share_price_usd * sl_pct / portfolio_equity) * 100.0, 2),
                 current_shares=current_shares,
                 shares_diff=0.0,
                 is_rebalance_required=False,
                 approved_for_execution=True,
-                rationale="Změna pozice je pod minimálním finančním limitem brokera (< 2 USD). Rebalancování vynecháno.",
+                rationale="Změna pozice je pod minimálním finančním limitem brokera (< 10 USD). Rebalancování vynecháno.",
             )
+
         if current_shares > 0 and target_shares > 0:
             pct_change = abs(shares_diff) / target_shares * 100.0
             if pct_change < self.inertia_buffer_pct:
@@ -197,10 +249,10 @@ class CarverRiskEngine:
                 return PositionSizingResult(
                     ticker=ticker,
                     target_shares=round(current_shares, 4),
-                    target_value=round(current_shares * curr_price, 2),
-                    portfolio_weight_pct=round((current_shares * curr_price / portfolio_equity) * 100.0, 2),
-                    risk_per_trade_cash=round(current_shares * curr_price * sl_pct, 2),
-                    risk_per_trade_pct=round((current_shares * curr_price * sl_pct / portfolio_equity) * 100.0, 2),
+                    target_value=round(current_shares * share_price_usd, 2),
+                    portfolio_weight_pct=round((current_shares * share_price_usd / portfolio_equity) * 100.0, 2),
+                    risk_per_trade_cash=round(current_shares * share_price_usd * sl_pct, 2),
+                    risk_per_trade_pct=round((current_shares * share_price_usd * sl_pct / portfolio_equity) * 100.0, 2),
                     current_shares=current_shares,
                     shares_diff=0.0,
                     is_rebalance_required=False,
@@ -209,8 +261,8 @@ class CarverRiskEngine:
                 )
 
         rationale = (
-            f"Carver alokace: Cíl {target_shares:.2f} ks ({target_value:.2f} CZK / {portfolio_weight:.1f} % portfolia). "
-            f"SL riziko: {risk_cash:.2f} CZK ({risk_pct:.2f} % ekvity). "
+            f"Carver alokace: Cíl {target_shares:.2f} ks ({target_value:.2f} USD / {portfolio_weight:.1f} % portfolia). "
+            f"SL riziko: {risk_cash:.2f} USD ({risk_pct:.2f} % ekvity). "
             f"Faktor režimu: {regime.risk_multiplier:.2f}."
         )
 

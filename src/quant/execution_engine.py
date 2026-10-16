@@ -87,26 +87,30 @@ class ExecutionEngine:
         quantity: float,
         estimated_price: float,
         available_cash: float,
+        fx_rates: Optional[Dict[str, float]] = None,
     ) -> tuple[bool, str]:
         """
         Předobchodní verifikace stavu:
         1. Vymáhá Long-Only pro Trading 212 Invest účet (zamítá neexistující SHORT).
         2. Kontroluje dostatek hotovosti pro BUY včetně rezervy na poplatky.
-        3. Kontroluje minimální smysluplné množství.
+        3. Kontroluje minimální smysluplné množství (min notional ~5 USD).
         """
         # 1. Long-only kontrola
         if side == OrderSide.SELL and quantity <= 0:
             return False, f"Neplatný SELL příkaz pro {ticker}: množství <= 0."
 
         if side == OrderSide.BUY:
-            if quantity <= 0 or estimated_price <= 0:
-                return False, f"Neplatný BUY příkaz pro {ticker}: množství={quantity}, cena={estimated_price}."
+            from src.quant.risk_engine import CarverRiskEngine
+            price_usd = CarverRiskEngine.get_share_price_usd(ticker, estimated_price, fx_rates)
 
-            # Minimální finanční limit brokera (min notional ~1.5 USD)
-            if quantity * estimated_price < 1.5:
-                return False, f"Objem příkazu pro {ticker} ({quantity * estimated_price:.2f} USD) je pod minimálním limitem brokera (< 1.5 USD)."
+            if quantity <= 0 or price_usd <= 0:
+                return False, f"Neplatný BUY příkaz pro {ticker}: množství={quantity}, cena={price_usd}."
 
-            required_cash = quantity * estimated_price * 1.005  # 0.5% rezerva na skluz/poplatky
+            # Minimální finanční limit brokera (min notional ~5 USD)
+            if quantity * price_usd < 5.0:
+                return False, f"Objem příkazu pro {ticker} ({quantity * price_usd:.2f} USD) je pod minimálním limitem brokera (< 5 USD)."
+
+            required_cash = quantity * price_usd * 1.005  # 0.5% rezerva na skluz/poplatky
             if required_cash > available_cash:
                 return False, (
                     f"Nedostatek hotovosti: Požadováno {required_cash:.2f} USD, "
@@ -121,6 +125,7 @@ class ExecutionEngine:
         barriers: TripleBarriers,
         available_cash: float,
         timestamp: Optional[datetime] = None,
+        fx_rates: Optional[Dict[str, float]] = None,
     ) -> Optional[ExecutionOrder]:
         """
         Vytvoří a bezpečně odešle objednávku na základě rizikové kalkulace.
@@ -144,6 +149,7 @@ class ExecutionEngine:
             quantity=qty,
             estimated_price=barriers.entry_price,
             available_cash=available_cash,
+            fx_rates=fx_rates,
         )
         if not ok:
             logger.warning(f"{ticker}: Pre-trade reconciliation selhala: {reason}")
@@ -164,8 +170,8 @@ class ExecutionEngine:
 
         broker_ticker = self.ticker_mapper.to_t212_ticker(ticker)
 
-        # Výchozí zaokrouhlení: UK akcie (LSE - l_EQ) povolují max 3 desetinná místa, US 4
-        precision = 3 if broker_ticker.endswith("l_EQ") else 4
+        # Výchozí zaokrouhlení: Evropské akcie (*_EQ bez _US_EQ) povolují max 3 desetinná místa, US 4
+        precision = 3 if (broker_ticker.endswith("_EQ") and not broker_ticker.endswith("_US_EQ")) else 4
         order_qty = round(qty, precision) if side == OrderSide.BUY else -abs(round(qty, precision))
 
         if abs(order_qty) == 0:
@@ -205,6 +211,65 @@ class ExecutionEngine:
                     order.status = "REJECTED"
                     order.notes = f"Broker API nevrátilo order ID: {resp}"
             except Exception as e:
+                err_str = str(e)
+                # 1. Ošetření nedostatečné hotovosti (maržový/FX buffer brokera)
+                if "insufficient-free-for-stocks-buy" in err_str:
+                    try:
+                        reduced_qty = round(order_qty * 0.75, precision)
+                        if abs(reduced_qty) > 0:
+                            logger.warning(
+                                f"{ticker}: Nedostatek volných prostředků / maržový buffer brokera. "
+                                f"Automaticky snižuji na 75 % ({reduced_qty} ks) a opakuji pokus..."
+                            )
+                            resp = self.client.place_order(
+                                ticker=broker_ticker,
+                                quantity=reduced_qty,
+                                side=side.value if hasattr(side, "value") else str(side),
+                                order_type="MARKET",
+                            )
+                            if resp and ("id" in resp or "orderId" in resp):
+                                order.quantity = abs(reduced_qty)
+                                order.broker_order_id = str(resp.get("id") or resp.get("orderId"))
+                                order.status = "FILLED"
+                                order.executed_price = barriers.entry_price
+                                logger.info(f"Příkaz úspěšně přijat brokerem po redukci: ID {order.broker_order_id}")
+                                self.executed_orders_log[client_order_id] = order
+                                return order
+                    except Exception as retry_e:
+                        logger.warning(f"{ticker}: Ani po 25% redukci se nepodařilo příkaz odeslat: {retry_e}")
+
+                # 2. Ošetření minimálního množství požadovaného brokerem
+                elif "min-quantity-exceeded" in err_str:
+                    import re
+                    m = re.search(r"must trade at least\s*([\d\.]+)", err_str)
+                    if m:
+                        min_req_qty = float(m.group(1))
+                        from src.quant.risk_engine import CarverRiskEngine
+                        est_usd = CarverRiskEngine.get_share_price_usd(ticker, barriers.entry_price, fx_rates)
+                        req_cost_usd = min_req_qty * est_usd
+                        if available_cash and req_cost_usd <= available_cash * 1.15:
+                            try:
+                                logger.warning(
+                                    f"{ticker}: Broker vyžaduje minimálně {min_req_qty} ks (~${req_cost_usd:.2f}). "
+                                    f"Upravuji na požadované minimum a opakuji pokus..."
+                                )
+                                resp = self.client.place_order(
+                                    ticker=broker_ticker,
+                                    quantity=min_req_qty,
+                                    side=side.value if hasattr(side, "value") else str(side),
+                                    order_type="MARKET",
+                                )
+                                if resp and ("id" in resp or "orderId" in resp):
+                                    order.quantity = min_req_qty
+                                    order.broker_order_id = str(resp.get("id") or resp.get("orderId"))
+                                    order.status = "FILLED"
+                                    order.executed_price = barriers.entry_price
+                                    logger.info(f"Příkaz úspěšně přijat brokerem po úpravě na minimum: ID {order.broker_order_id}")
+                                    self.executed_orders_log[client_order_id] = order
+                                    return order
+                            except Exception as min_e:
+                                logger.warning(f"{ticker}: Chyba při opakování s minimálním množstvím: {min_e}")
+
                 logger.error(f"Chyba při odesílání příkazu na broker API: {e}", exc_info=True)
                 order.status = "REJECTED"
                 order.notes = f"Výjimka API: {str(e)}"

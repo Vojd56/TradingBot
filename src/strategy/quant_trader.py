@@ -125,6 +125,25 @@ class QuantTraderEngine:
         fallbacks = {"CZK": 1.0 / 23.5, "EUR": 1.08, "GBP": 1.28}
         return fallbacks.get(curr, 1.0)
 
+    @staticmethod
+    def get_market_fx_rates() -> Dict[str, float]:
+        """Získá aktuální live FX kurzy do USD pro EUR, GBP, CHF."""
+        rates = {"USD": 1.0, "EUR": 1.08, "GBP": 1.30, "CHF": 1.12}
+        try:
+            import yfinance as yf
+            eur_usd = yf.Ticker("EURUSD=X").fast_info.get("last_price")
+            if eur_usd and eur_usd > 0.5:
+                rates["EUR"] = float(eur_usd)
+            gbp_usd = yf.Ticker("GBPUSD=X").fast_info.get("last_price")
+            if gbp_usd and gbp_usd > 0.5:
+                rates["GBP"] = float(gbp_usd)
+            usd_chf = yf.Ticker("USDCHF=X").fast_info.get("last_price")
+            if usd_chf and usd_chf > 0.4:
+                rates["CHF"] = 1.0 / float(usd_chf)
+        except Exception as exc:
+            logger.debug(f"Nelze stáhnout live FX kurzy: {exc}")
+        return rates
+
     def get_portfolio_state(self) -> tuple[float, float, Dict[str, float]]:
         """
         Získá aktuální stav portfolia z Trading 212 API nebo lokálního trackeru.
@@ -267,7 +286,7 @@ class QuantTraderEngine:
             reverse=True
         )
 
-        # Zjištění čekajících objednávek na brokerovi (ochrana před duplicitami při zavřeném trhu)
+        # 7.1 Zjištění čekajících objednávek na brokerovi (ochrana před duplicitami při zavřeném trhu)
         pending_tickers: Set[str] = set()
         if not self.dry_run and self.client:
             try:
@@ -280,7 +299,8 @@ class QuantTraderEngine:
             except Exception as e:
                 logger.debug(f"Nelze načíst čekající objednávky: {e}")
 
-        remaining_cash = free_cash
+        # 7.2 Předvýběr aktivních kandidátů (vynechání čekajících a vetovaných pamětí chyb)
+        active_candidates: List[str] = []
         for ticker in qualifying_buys:
             if ticker in pending_tickers:
                 logger.info(f"{ticker}: Na brokerovi již čeká nevyřízený příkaz, vynechávám duplicitní objednávku.")
@@ -288,9 +308,6 @@ class QuantTraderEngine:
 
             ev = ev_results[ticker]
             feat = features_map[ticker]
-            curr_shares = current_positions.get(ticker, 0.0)
-
-            # Kontrola paměti chyb přes Qwen TradeReflectionEngine (VETO check)
             vwap_proxy = feat.current_price / max(1e-4, (1.0 + feat.mean_reversion_z_20 * 0.01))
             reflection_check = self.reflection_engine.check_candidate_against_memory(
                 ticker=ticker,
@@ -303,17 +320,44 @@ class QuantTraderEngine:
                 logger.warning(f"🚫 [VETO - Paměť chyb Qwen] Obchod pro {ticker} byl zablokován: {reflection_check.get('reason')}")
                 continue
 
+            active_candidates.append(ticker)
+
+        # 7.3 Dimenzování a exekuce s férovým rozdělením hotovosti
+        fx_rates = self.get_market_fx_rates()
+        remaining_cash = free_cash
+        remaining_candidates_count = len(active_candidates)
+
+        for ticker in active_candidates:
+            # Ponecháváme bezpečnostní rezervu alespoň 40 USD nebo 10 % z počáteční volné hotovosti pro maržové buffery brokera
+            safety_reserve = max(40.0, free_cash * 0.10)
+            usable_cash = max(0.0, remaining_cash - safety_reserve)
+
+            if usable_cash < 15.0:
+                logger.info(
+                    f"Dostupná volná hotovost ({remaining_cash:.2f} USD, rezerva {safety_reserve:.2f} USD) "
+                    f"nestačí na smysluplný nákup, ukončuji nákupy v tomto cyklu."
+                )
+                break
+
+            ev = ev_results[ticker]
+            feat = features_map[ticker]
+            curr_shares = current_positions.get(ticker, 0.0)
+
             if ticker.upper() in ai_approved_tickers:
                 logger.info(f"⭐ [Rada AI Konsenzus] {ticker} má ověřený nákupní konsenzus z hloubkového skenu Rady AI.")
 
-            # Výpočet cílové velikosti pozice
+            # Férové rozdělení dostupné hotovosti mezi zbývající schválené kandidáty
+            budget_for_candidate = usable_cash / max(1, remaining_candidates_count)
+
+            # Výpočet cílové velikosti pozice s normalizovanými cenami v USD
             sizing = self.risk_engine.calculate_position_size(
                 ev_result=ev,
                 features=feat,
                 regime=regime,
                 portfolio_equity=equity,
                 current_shares=curr_shares,
-                available_cash=remaining_cash,
+                available_cash=budget_for_candidate,
+                fx_rates=fx_rates,
             )
             sizing_results[ticker] = sizing
 
@@ -322,13 +366,32 @@ class QuantTraderEngine:
                 order = self.execution_engine.execute_sizing_order(
                     sizing=sizing,
                     barriers=ev.barriers,
-                    available_cash=remaining_cash,
+                    available_cash=budget_for_candidate,
                     timestamp=now,
+                    fx_rates=fx_rates,
                 )
                 if order:
                     executed_orders.append(order)
-                    if order.side == "BUY":
-                        remaining_cash -= (order.quantity * ev.barriers.entry_price)
+                    if order.status == "FILLED" and str(order.side).upper() in ("BUY", "ORDERSIDE.BUY"):
+                        share_price_usd = CarverRiskEngine.get_share_price_usd(ticker, ev.barriers.entry_price, fx_rates)
+                        cost_usd = order.quantity * share_price_usd
+
+                        # Obnova skutečné volné hotovosti z brokera pro eliminaci odchylek měn a skluzu
+                        if not self.dry_run and self.client:
+                            try:
+                                acc_cash = self.client.get_account_cash()
+                                summary = self.client.get_account_summary()
+                                curr = summary.get("currency", "USD").upper()
+                                usd_mult = self.get_usd_multiplier(curr)
+                                remaining_cash = float(acc_cash.get("free", 0.0)) * usd_mult
+                                logger.debug(f"Aktualizována volná hotovost z API brokera: {remaining_cash:.2f} USD")
+                            except Exception as e:
+                                logger.debug(f"Nelze obnovit hotovost z API, použita kalkulace: {e}")
+                                remaining_cash = max(0.0, remaining_cash - cost_usd)
+                        else:
+                            remaining_cash = max(0.0, remaining_cash - cost_usd)
+
+            remaining_candidates_count -= 1
 
         report = QuantCycleReport(
             timestamp=now,
