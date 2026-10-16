@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, Optional, Tuple
+from typing import Any, Dict, Optional, Tuple
 from config import settings
 from src.data.market_data import TechnicalMetrics
 from src.llm.sentiment_engine import LLMStockVerdict
@@ -15,6 +15,8 @@ class RiskManager:
     - Maximální počet současných pozic: 3
     - Horizont držení: týdny až měsíce (střední riziko)
     - Dynamické výstupy na bázi ATR (Average True Range)
+    
+    Fasáda delegující pokročilou rizikovou kontrolu na RiskGatekeeper a CarverRiskEngine.
     """
 
     def __init__(
@@ -23,11 +25,24 @@ class RiskManager:
         max_positions: Optional[int] = None,
         atr_sl_multiplier: float = 2.0,
         atr_tp_multiplier: float = 3.5,
+        gatekeeper: Optional[Any] = None,
     ):
         self.total_capital_eur = total_capital_eur or settings.initial_capital_eur
         self.max_positions = max_positions or settings.max_positions
         self.atr_sl_multiplier = atr_sl_multiplier
         self.atr_tp_multiplier = atr_tp_multiplier
+        
+        # Lazy import pro přerušení cirkulární závislosti src.quant <-> src.strategy
+        if gatekeeper is not None:
+            self.gatekeeper = gatekeeper
+        else:
+            from src.quant.risk_engine import RiskGatekeeper
+            self.gatekeeper = RiskGatekeeper(max_concurrent_positions=self.max_positions)
+            
+        from src.quant.risk_engine import CarverRiskEngine
+        self.carver_engine = CarverRiskEngine()
+
+
 
     @property
     def max_position_size_eur(self) -> float:

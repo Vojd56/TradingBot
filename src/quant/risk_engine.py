@@ -14,9 +14,11 @@ Implementuje pokročilé dimenzování pozic a řízení rizik dle Sekce 7 a 11 
    - Krácení či zamítnutí pozice při vysoké korelaci (> 0.65 / > 0.80) s již drženými aktivy.
 """
 
+from datetime import datetime
+import hashlib
 import logging
 import math
-from typing import Dict, List, Optional
+from typing import Any, Dict, List, Optional, Union
 from pydantic import BaseModel, Field
 
 from src.quant.features import StockFeatures
@@ -230,3 +232,280 @@ class CarverRiskEngine:
             return 0.5
 
         return 1.0
+
+
+class OrderIntent(BaseModel):
+    """Záměr objednávky předložený ke schválení RiskGatekeeperu."""
+    ticker: str
+    side: str = "BUY"  # BUY nebo SELL
+    entry_price: float = Field(..., gt=0.0)
+    stop_loss_price: float = Field(..., gt=0.0)
+    take_profit_price: Optional[float] = None
+    desired_shares: Optional[float] = None
+    suggested_allocation_eur: Optional[float] = None
+    strategy_id: str = "QUANT_STRATEGY"
+    timestamp: Optional[datetime] = None
+
+
+class PortfolioState(BaseModel):
+    """Aktuální reálný stav portfolia před exekucí."""
+    equity: float = Field(..., ge=0.0)
+    cash: float = Field(..., ge=0.0)
+    daily_realized_pnl: float = 0.0
+    daily_unrealized_pnl: float = 0.0
+    open_positions_count: int = 0
+    open_positions: Dict[str, Any] = Field(default_factory=dict)  # ticker -> shares nebo detail
+
+
+class MarketBar(BaseModel):
+    """Tržní svíčka v čase exekučního rozhodnutí pro kontrolu zastaralosti (stale data)."""
+    ticker: str
+    close: float
+    high: float
+    low: float
+    volume: float = 0.0
+    timestamp: datetime
+
+
+class ApprovedOrder(BaseModel):
+    """Schválený obchodní příkaz opatřený razítkem RiskGatekeeperu."""
+    approved: bool = True
+    client_order_id: str
+    ticker: str
+    side: str
+    shares: float = Field(..., gt=0.0)
+    entry_price: float
+    stop_loss: float
+    take_profit: float
+    risk_per_trade_cash: float
+    risk_per_trade_pct: float
+    allocation_cash: float
+    approved_at: datetime
+    notes: str = ""
+
+
+class RejectedOrder(BaseModel):
+    """Zamítnutý obchodní záměr s uvedením konkrétního bezpečnostního jističe."""
+    approved: bool = False
+    ticker: str
+    side: str
+    reason: str
+    rejected_at: datetime
+
+
+class RiskGatekeeper:
+    """
+    Sjednocený strážce rizika a poslední instance před exekucí pokynů.
+    
+    Vymáhá striktní provozní bezpečnost dle Sekce 4 a 11 v research.md:
+    1. Kontrola zastaralosti dat (Stale Data Guard): svíčka nesmí být starší než 120 sekund.
+    2. Denní Kill-Switch (Max Daily Loss): při denním propadu > 2.0 % blokuje nové obchody.
+    3. Limit současných pozic (Max Concurrent Positions): max 4 otevřené pozice.
+    4. Carverovo dimenzování s Half-Kelly limity a kontrolou rizika SL:
+       Q = floor( (Equity * max_risk_per_trade_pct) / |Entry - SL| )
+    5. Pásmo nečinnosti 20 % (No-Trade / Inertia Buffer): zákaz rebalancování při malé odchylce.
+    6. Idempotentní deterministický klíč (client_order_id): ochrana proti duplicitnímu odeslání.
+    """
+
+    def __init__(
+        self,
+        max_risk_per_trade_pct: float = 0.005,      # 0.5 % kapitálu na 1 obchod
+        max_position_notional_pct: float = 0.20,    # Max 20 % kapitálu na 1 titul
+        max_daily_loss_pct: float = 0.02,          # Max 2.0 % denní ztráta (Kill-Switch)
+        max_concurrent_positions: int = 4,         # Max 4 současné otevřené pozice
+        max_stale_seconds: int = 120,              # Max stáří svíčky 120 s
+        inertia_buffer_pct: float = 20.0,          # 20 % No-Trade buffer proti churningu
+        carver_engine: Optional[CarverRiskEngine] = None,
+    ):
+        self.max_risk_per_trade_pct = max_risk_per_trade_pct
+        self.max_position_notional_pct = max_position_notional_pct
+        self.max_daily_loss_pct = max_daily_loss_pct
+        self.max_concurrent_positions = max_concurrent_positions
+        self.max_stale_seconds = max_stale_seconds
+        self.inertia_buffer_pct = inertia_buffer_pct
+        self.carver_engine = carver_engine or CarverRiskEngine()
+        self.seen_order_ids: Dict[str, datetime] = {}
+
+    @staticmethod
+    def generate_client_order_id(
+        ticker: str,
+        side: str,
+        timestamp: datetime,
+        strategy_id: str,
+        shares: float,
+    ) -> str:
+        """
+        Vygeneruje deterministický hash idempotence SHA-256 zkrácený na 24 hex znaků.
+        Garantuje, že při síťovém timeoutu nebo duplicitním volání nevznikne dvojitá objednávka.
+        """
+        date_str = timestamp.strftime("%Y%m%d_%H%M")
+        raw_key = f"{strategy_id}:{ticker}:{date_str}:{side}:{shares:.4f}"
+        return hashlib.sha256(raw_key.encode("utf-8")).hexdigest()[:24]
+
+    def evaluate_order_intent(
+        self,
+        intent: OrderIntent,
+        portfolio: PortfolioState,
+        market_bar: Optional[MarketBar] = None,
+    ) -> Union[ApprovedOrder, RejectedOrder]:
+        """
+        Hlavní brána: prověří záměr a vydá ApprovedOrder nebo RejectedOrder.
+        """
+        now = datetime.now()
+
+        # 1. KONTROLA ZASTARALOSTI DAT (STALE DATA GUARD)
+        if market_bar is not None and market_bar.timestamp is not None:
+            bar_ts = market_bar.timestamp
+            # Srovnání časových pásem
+            ref_now = datetime.now(bar_ts.tzinfo) if bar_ts.tzinfo is not None else now
+            age_seconds = abs((ref_now - bar_ts).total_seconds())
+            if age_seconds > self.max_stale_seconds:
+                reason = f"STALE_DATA: Tržní data pro {intent.ticker} jsou stará {age_seconds:.0f} s (limit {self.max_stale_seconds} s)."
+                logger.warning(reason)
+                return RejectedOrder(ticker=intent.ticker, side=intent.side, reason=reason, rejected_at=now)
+
+        # 2. DENNÍ KILL-SWITCH (MAX DAILY LOSS GUARD)
+        daily_total_pnl = portfolio.daily_realized_pnl + portfolio.daily_unrealized_pnl
+        if portfolio.equity > 0:
+            daily_loss_pct = daily_total_pnl / portfolio.equity
+            if daily_loss_pct <= -self.max_daily_loss_pct:
+                reason = (
+                    f"DAILY_KILL_SWITCH: Celková denní ztráta {daily_loss_pct * 100:.2f} % "
+                    f"překročila limit {-self.max_daily_loss_pct * 100:.1f} %. Obchodování zastaveno."
+                )
+                logger.critical(reason)
+                return RejectedOrder(ticker=intent.ticker, side=intent.side, reason=reason, rejected_at=now)
+
+        # 3. EXEKUCE PRODEJE (SELL INTENT)
+        if intent.side.upper() == "SELL":
+            if intent.ticker not in portfolio.open_positions:
+                reason = f"SELL_NO_POSITION: Pokus o prodej neexistující pozice {intent.ticker}."
+                logger.warning(reason)
+                return RejectedOrder(ticker=intent.ticker, side=intent.side, reason=reason, rejected_at=now)
+
+            pos_val = portfolio.open_positions[intent.ticker]
+            cur_held = float(pos_val.get("shares", pos_val.get("quantity", 0.0))) if isinstance(pos_val, dict) else float(pos_val)
+            shares_to_sell = intent.desired_shares if intent.desired_shares and intent.desired_shares > 0 else cur_held
+
+            order_id = self.generate_client_order_id(
+                ticker=intent.ticker,
+                side="SELL",
+                timestamp=intent.timestamp or now,
+                strategy_id=intent.strategy_id,
+                shares=shares_to_sell,
+            )
+
+            if order_id in self.seen_order_ids:
+                reason = f"DUPLICATE_ORDER: Příkaz k prodeji s ID {order_id} již byl v minulosti schválen."
+                logger.warning(reason)
+                return RejectedOrder(ticker=intent.ticker, side="SELL", reason=reason, rejected_at=now)
+
+            self.seen_order_ids[order_id] = now
+            return ApprovedOrder(
+                approved=True,
+                client_order_id=order_id,
+                ticker=intent.ticker,
+                side="SELL",
+                shares=round(shares_to_sell, 4),
+                entry_price=intent.entry_price,
+                stop_loss=intent.stop_loss_price,
+                take_profit=intent.take_profit_price or 0.0,
+                risk_per_trade_cash=0.0,
+                risk_per_trade_pct=0.0,
+                allocation_cash=round(shares_to_sell * intent.entry_price, 2),
+                approved_at=now,
+                notes="Schválený prodejní pokyn",
+            )
+
+        # 4. LIMIT SOUČASNÝCH POZIC (MAX CONCURRENT POSITIONS GUARD)
+        is_new_position = intent.ticker not in portfolio.open_positions
+        if is_new_position and portfolio.open_positions_count >= self.max_concurrent_positions:
+            reason = (
+                f"MAX_CONCURRENT_POSITIONS: Dosažen limit {self.max_concurrent_positions} pozic "
+                f"(aktuálně {portfolio.open_positions_count})."
+            )
+            logger.info(reason)
+            return RejectedOrder(ticker=intent.ticker, side=intent.side, reason=reason, rejected_at=now)
+
+        # 5. KONTROLA STOP LOSSU A VÝPOČET RIZIKA NA AKCII
+        price_risk = intent.entry_price - intent.stop_loss_price
+        if price_risk <= 0.0001:
+            reason = f"INVALID_STOP_LOSS: Stop Loss ({intent.stop_loss_price:.2f}) musí být přísně pod nákupní cenou ({intent.entry_price:.2f})."
+            logger.warning(reason)
+            return RejectedOrder(ticker=intent.ticker, side=intent.side, reason=reason, rejected_at=now)
+
+        # 6. VÝPOČET VELIKOSTI POZICE (VOLATILITY TARGETING & RISK BUDGET)
+        # Q = floor( (Equity * max_risk_per_trade_pct) / |Entry - SL| )
+        risk_budget_cash = portfolio.equity * self.max_risk_per_trade_pct
+        q_risk = math.floor(risk_budget_cash / price_risk)
+
+        # Koncentrační strop (max 20 % kapitálu)
+        max_notional = portfolio.equity * self.max_position_notional_pct
+        q_notional = math.floor(max_notional / intent.entry_price)
+        target_shares = min(q_risk, q_notional)
+
+        # Pokud uživatel zadal explicitní desired_shares (např. z CarverEngine), zohledníme ho
+        if intent.desired_shares is not None and intent.desired_shares > 0:
+            target_shares = min(target_shares, math.floor(intent.desired_shares))
+
+        # Kontrola dostupné hotovosti
+        if portfolio.cash > 0:
+            max_cash_shares = math.floor(portfolio.cash / intent.entry_price)
+            target_shares = min(target_shares, max_cash_shares)
+
+        if target_shares <= 0:
+            reason = f"INSUFFICIENT_FUNDS_OR_RISK: Vypočtené množství pro {intent.ticker} je 0 ks."
+            logger.warning(reason)
+            return RejectedOrder(ticker=intent.ticker, side=intent.side, reason=reason, rejected_at=now)
+
+        # 7. CARVEROVO PÁSMO NEČINNOSTI (INERTIA / NO-TRADE BUFFER)
+        pos_val = portfolio.open_positions.get(intent.ticker)
+        if pos_val is not None:
+            cur_held = float(pos_val.get("shares", pos_val.get("quantity", 0.0))) if isinstance(pos_val, dict) else float(pos_val)
+            if cur_held > 0:
+                pct_diff = abs(target_shares - cur_held) / cur_held * 100.0
+                if pct_diff < self.inertia_buffer_pct:
+                    reason = (
+                        f"NO_TRADE_INERTIA_BUFFER: Rozdíl v pozici {intent.ticker} ({pct_diff:.1f} %) "
+                        f"je uvnitř {self.inertia_buffer_pct:.0f}% pásma nečinnosti. Úprava vynechána."
+                    )
+                    logger.debug(reason)
+                    return RejectedOrder(ticker=intent.ticker, side=intent.side, reason=reason, rejected_at=now)
+
+        # 8. IDEMPOTENTNÍ KONTROLA DUPLICIT
+        order_id = self.generate_client_order_id(
+            ticker=intent.ticker,
+            side="BUY",
+            timestamp=intent.timestamp or now,
+            strategy_id=intent.strategy_id,
+            shares=float(target_shares),
+        )
+
+        if order_id in self.seen_order_ids:
+            reason = f"DUPLICATE_ORDER: Příkaz k nákupu s ID {order_id} již byl zpracován."
+            logger.warning(reason)
+            return RejectedOrder(ticker=intent.ticker, side="BUY", reason=reason, rejected_at=now)
+
+        self.seen_order_ids[order_id] = now
+
+        risk_cash = target_shares * price_risk
+        risk_pct = (risk_cash / portfolio.equity) * 100.0 if portfolio.equity > 0 else 0.0
+        alloc_cash = target_shares * intent.entry_price
+        tp_price = intent.take_profit_price or round(intent.entry_price + (2.0 * price_risk), 2)
+
+        return ApprovedOrder(
+            approved=True,
+            client_order_id=order_id,
+            ticker=intent.ticker,
+            side="BUY",
+            shares=float(target_shares),
+            entry_price=round(intent.entry_price, 4),
+            stop_loss=round(intent.stop_loss_price, 4),
+            take_profit=round(tp_price, 4),
+            risk_per_trade_cash=round(risk_cash, 2),
+            risk_per_trade_pct=round(risk_pct, 2),
+            allocation_cash=round(alloc_cash, 2),
+            approved_at=now,
+            notes="Schváleno RiskGatekeeperem",
+        )
+
