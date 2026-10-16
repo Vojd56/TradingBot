@@ -102,11 +102,15 @@ class ExecutionEngine:
             if quantity <= 0 or estimated_price <= 0:
                 return False, f"Neplatný BUY příkaz pro {ticker}: množství={quantity}, cena={estimated_price}."
 
+            # Minimální finanční limit brokera (min notional ~1.5 USD)
+            if quantity * estimated_price < 1.5:
+                return False, f"Objem příkazu pro {ticker} ({quantity * estimated_price:.2f} USD) je pod minimálním limitem brokera (< 1.5 USD)."
+
             required_cash = quantity * estimated_price * 1.005  # 0.5% rezerva na skluz/poplatky
             if required_cash > available_cash:
                 return False, (
-                    f"Nedostatek hotovosti: Požadováno {required_cash:.2f} CZK, "
-                    f"k dispozici {available_cash:.2f} CZK."
+                    f"Nedostatek hotovosti: Požadováno {required_cash:.2f} USD, "
+                    f"k dispozici {available_cash:.2f} USD."
                 )
 
         return True, "Reconciliation OK"

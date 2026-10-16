@@ -137,10 +137,6 @@ class CarverRiskEngine:
 
         capped_value = min(target_value_initial, max_allowed_value)
 
-        # Omezení dostupnou hotovostí (pokud je specifikována)
-        if available_cash is not None and available_cash > 0:
-            capped_value = min(capped_value, available_cash * 0.98)  # 2% rezerva na skluz
-
         # 7. Riziko při Stop Lossu (nesmí překročit max_risk_per_trade_pct)
         sl_pct = ev_result.barriers.stop_loss_pct / 100.0
         max_allowed_loss_cash = portfolio_equity * (self.max_risk_per_trade_pct / 100.0)
@@ -156,8 +152,41 @@ class CarverRiskEngine:
         risk_cash = round(target_value * sl_pct, 2)
         risk_pct = round((risk_cash / portfolio_equity) * 100.0, 2)
 
-        # 8. Carverovo 10% pásmo nečinnosti (Inertia Buffer)
+        # 8. Rozdíl a Carverovo 10% pásmo nečinnosti (Inertia Buffer)
         shares_diff = target_shares - current_shares
+
+        # Omezení nového nákupu dostupnou hotovostí (hotovost omezuje pouze přírůstek, nikdy nenutí prodávat)
+        if shares_diff > 0 and available_cash is not None:
+            max_buy_cash = max(0.0, available_cash * 0.98)
+            max_add_shares = max_buy_cash / curr_price
+            if shares_diff > max_add_shares:
+                shares_diff = max_add_shares
+                target_shares = current_shares + shares_diff
+
+        # Pro Long-Only prodeje: nikdy neprodávat více, než je aktuálně vlastněno
+        if shares_diff < 0:
+            if current_shares <= 0:
+                shares_diff = 0.0
+                target_shares = 0.0
+            elif abs(shares_diff) > current_shares:
+                shares_diff = -current_shares
+                target_shares = 0.0
+
+        # Minimální smysluplná velikost obchodu (prachové obchody pod $2 vynechat)
+        if abs(shares_diff) * curr_price < 2.0:
+            return PositionSizingResult(
+                ticker=ticker,
+                target_shares=round(current_shares, 4),
+                target_value=round(current_shares * curr_price, 2),
+                portfolio_weight_pct=round((current_shares * curr_price / portfolio_equity) * 100.0, 2),
+                risk_per_trade_cash=round(current_shares * curr_price * sl_pct, 2),
+                risk_per_trade_pct=round((current_shares * curr_price * sl_pct / portfolio_equity) * 100.0, 2),
+                current_shares=current_shares,
+                shares_diff=0.0,
+                is_rebalance_required=False,
+                approved_for_execution=True,
+                rationale="Změna pozice je pod minimálním finančním limitem brokera (< 2 USD). Rebalancování vynecháno.",
+            )
         if current_shares > 0 and target_shares > 0:
             pct_change = abs(shares_diff) / target_shares * 100.0
             if pct_change < self.inertia_buffer_pct:

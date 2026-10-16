@@ -267,8 +267,25 @@ class QuantTraderEngine:
             reverse=True
         )
 
+        # Zjištění čekajících objednávek na brokerovi (ochrana před duplicitami při zavřeném trhu)
+        pending_tickers: Set[str] = set()
+        if not self.dry_run and self.client:
+            try:
+                from src.execution.ticker_mapper import TickerMapper
+                open_orders = self.client.get_open_orders()
+                for o in open_orders:
+                    raw_t = o.get("ticker", "")
+                    if raw_t:
+                        pending_tickers.add(TickerMapper.to_standard_ticker(raw_t))
+            except Exception as e:
+                logger.debug(f"Nelze načíst čekající objednávky: {e}")
+
         remaining_cash = free_cash
         for ticker in qualifying_buys:
+            if ticker in pending_tickers:
+                logger.info(f"{ticker}: Na brokerovi již čeká nevyřízený příkaz, vynechávám duplicitní objednávku.")
+                continue
+
             ev = ev_results[ticker]
             feat = features_map[ticker]
             curr_shares = current_positions.get(ticker, 0.0)
