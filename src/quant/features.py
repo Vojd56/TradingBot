@@ -16,6 +16,8 @@ import numpy as np
 import pandas as pd
 from pydantic import BaseModel, Field
 
+from src.strategy.market_hours import tag_market_session
+
 logger = logging.getLogger(__name__)
 
 
@@ -51,6 +53,18 @@ class StockFeatures(BaseModel):
     # Dlouhodobý trendový kontext
     price_to_sma200_ratio: float = 1.0            # Price / SMA 200
     sma200_slope_20d_pct: float = 0.0             # 20d změna SMA 200 v % (sklon trendu)
+
+    # Intradenní indikátory (Session VWAP, ORB 15m, Intradenní RVOL a RS)
+    vwap: float = 0.0
+    vwap_dist_pct: float = 0.0                    # ((Price - VWAP) / VWAP) * 100
+    vwap_dist_atr: float = 0.0                    # (Price - VWAP) / ATR
+    vwap_upper_2: float = 0.0
+    vwap_lower_2: float = 0.0
+    orb_high_15m: Optional[float] = None
+    orb_low_15m: Optional[float] = None
+    orb_width_atr: float = 0.0
+    rvol_at_time: float = 1.0
+    intraday_rs_zscore: float = 0.0
 
     # Průřezové pořadí (vyplněno po srovnání univerza)
     cross_sectional_rank: float = 0.5             # 0.0 (nejslabší) až 1.0 (nejsilnější v univerzu)
@@ -230,3 +244,238 @@ class CausalFeatureEngine:
             features_map[t].cross_sectional_rank = round(float(ranks[i]), 4)
 
         return features_map
+
+    @classmethod
+    def compute_session_vwap(cls, df: pd.DataFrame) -> pd.DataFrame:
+        """
+        Kauzální Session VWAP a směrodatné odchylky resetované přesně v 09:30 EST každého dne.
+        Počítáno výhradně z REGULAR session svíček (09:30–16:00 EST).
+        
+        Vrací DataFrame se sloupci:
+        - vwap: Volume-Weighted Average Price od 09:30
+        - vwap_std: směrodatná odchylka typické ceny vážená objemem
+        - vwap_upper_1, vwap_lower_1: ±1.0 sigma pásmo
+        - vwap_upper_2, vwap_lower_2: ±2.0 sigma pásmo
+        - vwap_upper_2_5, vwap_lower_2_5: ±2.5 sigma pásmo
+        - vwap_dist_pct: odchylka Close od VWAP v %
+        """
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        # Zajištění session značek
+        if "is_regular_session" not in df.columns or "trading_day" not in df.columns:
+            df_tagged = tag_market_session(df)
+        else:
+            df_tagged = df
+
+        reg = df_tagged["is_regular_session"]
+        tp = (df_tagged["High"] + df_tagged["Low"] + df_tagged["Close"]) / 3.0
+        vol = df_tagged["Volume"].clip(lower=0.0)
+
+        cols = [
+            "vwap", "vwap_std", "vwap_upper_1", "vwap_lower_1",
+            "vwap_upper_2", "vwap_lower_2", "vwap_upper_2_5", "vwap_lower_2_5", "vwap_dist_pct"
+        ]
+        res = pd.DataFrame(index=df_tagged.index, columns=cols, dtype=float)
+
+        if not reg.any():
+            return res
+
+        reg_df = df_tagged.loc[reg]
+        reg_vol = vol.loc[reg]
+        reg_tp = tp.loc[reg]
+        reg_days = reg_df["trading_day"]
+
+        # Kumulativní objem a kumulativní součin P * V od 09:30 pro každý den
+        cum_vol = reg_vol.groupby(reg_days).cumsum()
+        cum_pv = (reg_vol * reg_tp).groupby(reg_days).cumsum()
+        vwap = cum_pv / cum_vol.replace(0, np.nan)
+
+        # Vážená směrodatná odchylka typické ceny od VWAP
+        dev = reg_tp - vwap
+        cum_sq_dev = (reg_vol * (dev ** 2)).groupby(reg_days).cumsum()
+        vwap_var = cum_sq_dev / cum_vol.replace(0, np.nan)
+        vwap_std = np.sqrt(np.maximum(0.0, vwap_var.fillna(0.0)))
+
+        res.loc[reg, "vwap"] = vwap
+        res.loc[reg, "vwap_std"] = vwap_std
+        res.loc[reg, "vwap_upper_1"] = vwap + vwap_std
+        res.loc[reg, "vwap_lower_1"] = vwap - vwap_std
+        res.loc[reg, "vwap_upper_2"] = vwap + 2.0 * vwap_std
+        res.loc[reg, "vwap_lower_2"] = vwap - 2.0 * vwap_std
+        res.loc[reg, "vwap_upper_2_5"] = vwap + 2.5 * vwap_std
+        res.loc[reg, "vwap_lower_2_5"] = vwap - 2.5 * vwap_std
+        res.loc[reg, "vwap_dist_pct"] = ((reg_df["Close"] - vwap) / vwap.replace(0, np.nan)) * 100.0
+
+        return res
+
+    @classmethod
+    def compute_opening_range(cls, df: pd.DataFrame, orb_minutes: int = 15) -> pd.DataFrame:
+        """
+        Kauzální výpočet Opening Range (ORB) z prvních `orb_minutes` minut (09:30–09:45 EST).
+        
+        KRITICKÉ: Před časem 09:45 EST (minutes_from_open < orb_minutes) jsou hodnoty přísně NaN
+        pro vyloučení jakéhokoliv look-ahead biasu!
+        
+        Vrací DataFrame se sloupci:
+        - orb_high: maximum prvních orb_minutes
+        - orb_low: minimum prvních orb_minutes
+        - orb_width: šířka (orb_high - orb_low)
+        """
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        if "is_regular_session" not in df.columns or "minutes_from_open" not in df.columns or "trading_day" not in df.columns:
+            df_tagged = tag_market_session(df)
+        else:
+            df_tagged = df
+
+        cols = ["orb_high", "orb_low", "orb_width"]
+        res = pd.DataFrame(index=df_tagged.index, columns=cols, dtype=float)
+
+        orb_mask = (
+            df_tagged["is_regular_session"]
+            & (df_tagged["minutes_from_open"] >= 0)
+            & (df_tagged["minutes_from_open"] < orb_minutes)
+        )
+        orb_bars = df_tagged[orb_mask]
+
+        if orb_bars.empty:
+            return res
+
+        day_highs = orb_bars.groupby("trading_day")["High"].max()
+        day_lows = orb_bars.groupby("trading_day")["Low"].min()
+
+        mapped_high = df_tagged["trading_day"].map(day_highs)
+        mapped_low = df_tagged["trading_day"].map(day_lows)
+        mapped_width = mapped_high - mapped_low
+
+        # Přísné kauzální pravidlo: platné POUZE od 09:45 EST (minutes_from_open >= orb_minutes)
+        valid_mask = df_tagged["is_regular_session"] & (df_tagged["minutes_from_open"] >= orb_minutes)
+        res["orb_high"] = mapped_high.where(valid_mask, np.nan)
+        res["orb_low"] = mapped_low.where(valid_mask, np.nan)
+        res["orb_width"] = mapped_width.where(valid_mask, np.nan)
+
+        return res
+
+    @classmethod
+    def compute_rvol_at_time(cls, df: pd.DataFrame, lookback_days: int = 20) -> pd.Series:
+        """
+        Kauzální výpočet relativního objemu v danou minutu dne (RVOL at time).
+        Poměr kumulativního objemu od 09:30 do minuty m vůči 20dennímu klouzavému průměru
+        kumulativního objemu v téže minutě m za předchozí dny.
+        
+        Používá přísný jednodenní posun (.shift(1)), aby byl vyloučen pohled do budoucna.
+        """
+        if df is None or df.empty:
+            return pd.Series(dtype=float)
+
+        if "is_regular_session" not in df.columns or "minutes_from_open" not in df.columns or "trading_day" not in df.columns:
+            df_tagged = tag_market_session(df)
+        else:
+            df_tagged = df
+
+        res = pd.Series(1.0, index=df_tagged.index, dtype=float)
+        reg = df_tagged["is_regular_session"]
+        if not reg.any():
+            return res
+
+        reg_df = df_tagged.loc[reg].copy()
+        reg_df["_cum_vol"] = reg_df.groupby("trading_day")["Volume"].cumsum()
+
+        pivot = reg_df.pivot_table(
+            index="trading_day",
+            columns="minutes_from_open",
+            values="_cum_vol",
+            aggfunc="last",
+        ).ffill(axis=1)
+
+        # Přísný shift(1) po řádcích (dnech) a klouzavý průměr
+        hist_avg = pivot.shift(1).rolling(window=lookback_days, min_periods=1).mean()
+        stacked = hist_avg.stack()
+
+        idx = pd.MultiIndex.from_arrays([reg_df["trading_day"], reg_df["minutes_from_open"]])
+        expected_vol = idx.map(stacked)
+
+        # Pro první den nebo chybějící historii použijeme 1.0 jako neutrální fallback
+        rvol = (reg_df["_cum_vol"] / expected_vol).fillna(1.0).replace([np.inf, -np.inf], 1.0)
+        res.loc[reg] = rvol
+        return res
+
+    @classmethod
+    def compute_intraday_rs(
+        cls,
+        stock_df: pd.DataFrame,
+        benchmark_df: Optional[pd.DataFrame] = None,
+        window: int = 6,
+    ) -> pd.Series:
+        """
+        Kauzální relativní síla akcie vůči benchmarku (SPY) očištěná o volatilitu (z-skóre).
+        RS_z = clip((Ret_stock - beta * Ret_bench) / sigma_diff, -3.0, 3.0)
+        """
+        if stock_df is None or stock_df.empty:
+            return pd.Series(dtype=float)
+
+        if benchmark_df is None or benchmark_df.empty or "Close" not in benchmark_df.columns:
+            return pd.Series(0.0, index=stock_df.index, dtype=float)
+
+        bench_close = benchmark_df["Close"].reindex(stock_df.index).ffill()
+        stock_ret = stock_df["Close"].pct_change(window)
+        bench_ret = bench_close.pct_change(window)
+
+        cov = stock_ret.rolling(30, min_periods=window).cov(bench_ret)
+        var_b = bench_ret.rolling(30, min_periods=window).var()
+        beta = (cov / var_b.replace(0, np.nan)).fillna(1.0).clip(0.1, 3.0)
+
+        excess_ret = stock_ret - beta * bench_ret
+        diff_std = excess_ret.rolling(30, min_periods=window).std().replace(0, np.nan)
+        rs_z = (excess_ret / diff_std).fillna(0.0).clip(-3.0, 3.0)
+        return rs_z
+
+    @classmethod
+    def compute_intraday_features(
+        cls,
+        df: pd.DataFrame,
+        benchmark_df: Optional[pd.DataFrame] = None,
+    ) -> pd.DataFrame:
+        """
+        Komplexní obohacení intradenních OHLCV dat o kauzální příznaky (VWAP, ORB, RVOL, RS, ATR).
+        Garantuje nulový look-ahead bias a kompatibilitu s backtesterem i skenerem.
+        """
+        if df is None or df.empty:
+            return pd.DataFrame()
+
+        df_out = tag_market_session(df)
+
+        # 1. Session VWAP
+        vwap_df = cls.compute_session_vwap(df_out)
+        for col in vwap_df.columns:
+            df_out[col] = vwap_df[col]
+
+        # 2. Opening Range (15m)
+        orb_df = cls.compute_opening_range(df_out, orb_minutes=15)
+        for col in orb_df.columns:
+            df_out[col] = orb_df[col]
+
+        # 3. RVOL at time
+        df_out["rvol_at_time"] = cls.compute_rvol_at_time(df_out)
+
+        # 4. Intradenní ATR (14 a 20 barů)
+        df_out["atr_14"] = cls.calculate_atr(df_out, period=14)
+        df_out["atr_20"] = cls.calculate_atr(df_out, period=20)
+        df_out["vwap_dist_atr"] = (df_out["Close"] - df_out["vwap"]) / df_out["atr_14"].replace(0, np.nan)
+        df_out["orb_width_atr"] = df_out["orb_width"] / df_out["atr_14"].replace(0, np.nan)
+
+        # 5. Relative Strength vs Benchmark
+        df_out["intraday_rs_zscore"] = cls.compute_intraday_rs(df_out, benchmark_df=benchmark_df)
+
+        return df_out
+
+
+# Modulové funkce pro přímý import
+compute_session_vwap = CausalFeatureEngine.compute_session_vwap
+compute_opening_range = CausalFeatureEngine.compute_opening_range
+compute_rvol_at_time = CausalFeatureEngine.compute_rvol_at_time
+compute_intraday_rs = CausalFeatureEngine.compute_intraday_rs
+compute_intraday_features = CausalFeatureEngine.compute_intraday_features
+
