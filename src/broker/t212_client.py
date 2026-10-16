@@ -137,6 +137,14 @@ class Trading212Client:
         """Vrátí všechny aktuálně otevřené pozice."""
         return self._request("GET", "/api/v0/equity/portfolio")
 
+    def get_positions(self) -> List[Dict[str, Any]]:
+        """Alias pro get_portfolio() pro kompatibilitu napříč strategiemi."""
+        return self.get_portfolio()
+
+    def get_open_positions(self) -> List[Dict[str, Any]]:
+        """Alias pro get_portfolio() pro kompatibilitu s BrokerAdapter."""
+        return self.get_portfolio()
+
     def get_open_position(self, ticker: str) -> Optional[Dict[str, Any]]:
         """Vrátí detail konkrétní pozice podle tickeru."""
         try:
@@ -144,6 +152,42 @@ class Trading212Client:
         except Trading212APIError as exc:
             if exc.status_code == 404:
                 return None
+            raise
+
+    def place_order(
+        self,
+        ticker: str,
+        quantity: float,
+        side: Optional[str] = None,
+        order_type: str = "MARKET",
+        extended_hours: bool = False,
+        **kwargs
+    ) -> Dict[str, Any]:
+        """
+        Univerzální metoda pro odeslání příkazu na Trading 212 API.
+        Kladná quantity = BUY, záporná quantity = SELL (případně odvozeno ze side).
+        """
+        from src.execution.ticker_mapper import TickerMapper
+        t212_ticker = TickerMapper.to_t212_ticker(ticker)
+
+        order_qty = quantity
+        if side:
+            order_qty = abs(quantity) if str(side).upper() in ("BUY", "ORDERSIDE.BUY") else -abs(quantity)
+
+        try:
+            return self.place_market_order(
+                ticker=t212_ticker,
+                quantity=order_qty,
+                extended_hours=extended_hours,
+            )
+        except Trading212APIError as exc:
+            if extended_hours:
+                logger.info(f"Extended hours order failed ({exc}), falling back to regular hours for {t212_ticker}")
+                return self.place_market_order(
+                    ticker=t212_ticker,
+                    quantity=order_qty,
+                    extended_hours=False,
+                )
             raise
 
     def place_market_order(

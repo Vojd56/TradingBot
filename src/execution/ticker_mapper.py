@@ -31,6 +31,12 @@ class TickerMapper:
         "NESN.SW": "NESNs_EQ",
         "NESN": "NESNs_EQ",
         "ASML.AS": "ASMLa_EQ",
+        "TTE.PA": "TTEp_EQ",
+        "TTE": "TTEp_EQ",
+        "AIR.PA": "AIRp_EQ",
+        "AIR": "AIRp_EQ",
+        "RIO.L": "RIOl_EQ",
+        "RIO": "RIOl_EQ",
     }
 
     REVERSE_SPECIAL: Dict[str, str] = {
@@ -46,6 +52,9 @@ class TickerMapper:
         "NOVCd_EQ": "NOVO-B.CO",
         "NESNs_EQ": "NESN.SW",
         "ASMLa_EQ": "ASML.AS",
+        "TTEp_EQ": "TTE.PA",
+        "AIRp_EQ": "AIR.PA",
+        "RIOl_EQ": "RIO.L",
     }
 
     @classmethod
@@ -54,13 +63,14 @@ class TickerMapper:
         Převede standardní ticker na T212 symbol.
         Např.: 'NVDA' -> 'NVDA_US_EQ', 'BRK-B' -> 'BRKb_US_EQ'.
         """
-        clean = standard_ticker.strip().upper()
+        raw = standard_ticker.strip()
+        # Pokud již obsahuje příponu, vrátíme beze změny (zachováme původní velikost písmen jako SMSNl_EQ)
+        if raw.endswith("_US_EQ") or raw.endswith("_EQ"):
+            return raw
+
+        clean = raw.upper()
         if clean in cls.SPECIAL_MAPPINGS:
             return cls.SPECIAL_MAPPINGS[clean]
-
-        # Pokud již obsahuje příponu, vrátíme beze změny
-        if clean.endswith("_US_EQ") or "_EQ" in clean:
-            return clean
 
         # Automatické mapování evropských burzovních koncovek na Trading 212 formát
         if clean.endswith(".DE"):

@@ -255,6 +255,42 @@ def test_paper_broker_adapter():
     print("  [OK] PaperBrokerAdapter provedl virtuální nákup a správně aktualizoval hotovost i pozice.")
 
 
+def test_trading212_client_compatibility_methods():
+    print("\n--- [11] Test Trading212Client Compatibility Aliases ---")
+    client = Trading212Client()
+
+    # 1. Ověření existence aliasů pro portfolio/pozice
+    assert hasattr(client, "get_positions")
+    assert hasattr(client, "get_open_positions")
+    assert hasattr(client, "place_order")
+
+    # 2. Test place_order s mockovaným place_market_order
+    mock_orders = []
+
+    def fake_place_market_order(ticker, quantity, extended_hours=False):
+        mock_orders.append({"ticker": ticker, "quantity": quantity, "extended_hours": extended_hours})
+        return {"id": "MOCK_ORDER_123", "status": "CONFIRMED"}
+
+    original_method = client.place_market_order
+    client.place_market_order = fake_place_market_order
+
+    try:
+        # Nákup (BUY)
+        resp_buy = client.place_order(ticker="MSFT", quantity=10.0, side="BUY")
+        assert resp_buy["id"] == "MOCK_ORDER_123"
+        assert mock_orders[-1]["ticker"] == "MSFT_US_EQ"
+        assert mock_orders[-1]["quantity"] == 10.0
+
+        # Prodej (SELL) - záporná quantity
+        resp_sell = client.place_order(ticker="MSFT_US_EQ", quantity=5.0, side="SELL")
+        assert resp_sell["id"] == "MOCK_ORDER_123"
+        assert mock_orders[-1]["ticker"] == "MSFT_US_EQ"
+        assert mock_orders[-1]["quantity"] == -5.0
+        print("  [OK] Trading212Client place_order správně transformuje tickery i polaritu pro BUY/SELL.")
+    finally:
+        client.place_market_order = original_method
+
+
 if __name__ == "__main__":
     try:
         test_ticker_mapper()
@@ -267,6 +303,7 @@ if __name__ == "__main__":
         test_gatekeeper_inertia_buffer()
         test_order_executor_blocks_unapproved_order()
         test_paper_broker_adapter()
+        test_trading212_client_compatibility_methods()
         print("\n==========================================")
         print("  ETAPA 3 (AG-04) ÚSPĚŠNĚ DOKONČENA A OVĚŘENA")
         print("==========================================\n")

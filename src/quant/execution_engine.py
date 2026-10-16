@@ -178,17 +178,18 @@ class ExecutionEngine:
         # Exekuce u brokera (pokud je live režim a máme klienta)
         if self.is_live and self.client:
             try:
-                logger.info(f"Odesílám {side} příkaz na {broker_ticker} ({qty} ks) přes Trading 212 API...")
+                order_qty = round(qty, 4) if side == OrderSide.BUY else -abs(round(qty, 4))
                 resp = self.client.place_order(
                     ticker=broker_ticker,
-                    quantity=round(qty, 4),
+                    quantity=order_qty,
+                    side=side.value if hasattr(side, "value") else str(side),
                     order_type="MARKET",
                 )
-                if resp and "id" in resp:
-                    order.broker_order_id = resp["id"]
+                if resp and ("id" in resp or "orderId" in resp):
+                    order.broker_order_id = str(resp.get("id") or resp.get("orderId"))
                     order.status = "FILLED"
                     order.executed_price = barriers.entry_price
-                    logger.info(f"Příkaz úspěšně přijat brokerem: ID {resp['id']}")
+                    logger.info(f"Příkaz úspěšně přijat brokerem: ID {order.broker_order_id}")
                 else:
                     order.status = "REJECTED"
                     order.notes = f"Broker API nevrátilo order ID: {resp}"

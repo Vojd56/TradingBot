@@ -92,10 +92,43 @@ class QuantTraderEngine:
         )
         self.monitoring = QuantMonitoringSystem()
 
+    @staticmethod
+    def get_usd_multiplier(currency: str) -> float:
+        """Přepočítací koeficient pro převod měny účtu (např. CZK, EUR, GBP) do USD."""
+        curr = currency.upper().strip()
+        if curr in ("USD", "$"):
+            return 1.0
+
+        try:
+            import yfinance as yf
+            if curr == "CZK":
+                ticker_df = yf.Ticker("CZK=X").history(period="5d")
+                if not ticker_df.empty:
+                    usd_czk = float(ticker_df["Close"].iloc[-1])
+                    if usd_czk > 1.0:
+                        return 1.0 / usd_czk
+            elif curr == "EUR":
+                ticker_df = yf.Ticker("EURUSD=X").history(period="5d")
+                if not ticker_df.empty:
+                    eur_usd = float(ticker_df["Close"].iloc[-1])
+                    if eur_usd > 0.5:
+                        return eur_usd
+            elif curr == "GBP":
+                ticker_df = yf.Ticker("GBPUSD=X").history(period="5d")
+                if not ticker_df.empty:
+                    gbp_usd = float(ticker_df["Close"].iloc[-1])
+                    if gbp_usd > 0.5:
+                        return gbp_usd
+        except Exception:
+            pass
+
+        fallbacks = {"CZK": 1.0 / 23.5, "EUR": 1.08, "GBP": 1.28}
+        return fallbacks.get(curr, 1.0)
+
     def get_portfolio_state(self) -> tuple[float, float, Dict[str, float]]:
         """
         Získá aktuální stav portfolia z Trading 212 API nebo lokálního trackeru.
-        Vrací (total_equity, free_cash, positions_map).
+        Vrací (total_equity, free_cash, positions_map) v USD.
         """
         equity = 100_000.0
         free_cash = 100_000.0
@@ -104,16 +137,29 @@ class QuantTraderEngine:
         if not self.dry_run:
             try:
                 acc_cash = self.client.get_account_cash()
-                if acc_cash:
-                    equity = float(acc_cash.get("total", 100_000.0))
-                    free_cash = float(acc_cash.get("free", equity))
+                summary = self.client.get_account_summary()
+                curr = summary.get("currency", "USD").upper()
+
+                raw_equity = float(acc_cash.get("total", 100_000.0))
+                raw_free_cash = float(acc_cash.get("free", raw_equity))
+
+                usd_mult = self.get_usd_multiplier(curr)
+                equity = raw_equity * usd_mult
+                free_cash = raw_free_cash * usd_mult
+
+                logger.info(
+                    f"Účet T212 ({curr}): Ekvita {raw_equity:.2f} {curr} -> {equity:.2f} USD | "
+                    f"Volná hotovost: {raw_free_cash:.2f} {curr} -> {free_cash:.2f} USD"
+                )
 
                 open_pos = self.client.get_positions()
                 if open_pos:
+                    from src.execution.ticker_mapper import TickerMapper
                     for p in open_pos:
                         t = p.get("ticker", "")
                         qty = float(p.get("quantity", 0.0))
-                        positions[t] = qty
+                        std_t = TickerMapper.to_standard_ticker(t)
+                        positions[std_t] = qty
             except Exception as e:
                 logger.error(f"Chyba při stahování stavu z T212 API: {e}", exc_info=True)
                 # Použijeme tracker jako fallback
