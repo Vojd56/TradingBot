@@ -101,13 +101,8 @@ class OrderExecutor:
         open_positions = self.tracker.get_open_positions()
         open_dict = {ticker: rec.quantity for ticker, rec in open_positions.items()}
 
-        try:
-            cash = float(self.broker_adapter.get_account_cash())
-        except Exception:
-            cash = 0.0
-
-        if cash <= 0.0:
-            cash = float(getattr(settings, "initial_capital_eur", 50.0))
+        # Missing account data must stop execution; zero is a valid balance.
+        cash = float(self.broker_adapter.get_account_cash())
 
         positions_value = sum(rec.allocated_eur for rec in open_positions.values())
         equity = cash + positions_value
@@ -191,6 +186,9 @@ class OrderExecutor:
 
         try:
             order_res = self.broker_adapter.place_order(approved_order)
+            if not order_res.get("is_paper"):
+                logger.warning("Pokyn %s byl odeslán; tracker čeká na potvrzené fill události.", order_res.get("id"))
+                return None
 
             # Záznam do perzistentního trackeru
             self.tracker.record_buy(
@@ -266,6 +264,9 @@ class OrderExecutor:
 
         try:
             order_res = self.broker_adapter.place_order(approved_order)
+            if not order_res.get("is_paper"):
+                logger.warning("Prodej %s byl odeslán; realizovaný PnL se bez broker fill nezapisuje.", order_res.get("id"))
+                return None
 
             reason_str = f"{exit_signal.reason.value}: {exit_signal.message}" if exit_signal.reason else exit_signal.message
             self.tracker.record_sell(

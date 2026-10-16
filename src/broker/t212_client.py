@@ -1,9 +1,12 @@
 import logging
 import time
+import math
+import hashlib
+from urllib.parse import urlparse
 from typing import Any, Dict, List, Optional
 import requests
 from requests.auth import HTTPBasicAuth
-from config import settings
+from config import settings, TradingMode
 
 logger = logging.getLogger(__name__)
 
@@ -24,15 +27,22 @@ class Trading212Client:
         self,
         api_key: Optional[str] = None,
         api_secret: Optional[str] = None,
-        base_url: Optional[str] = None
+        base_url: Optional[str] = None,
+        journal_path: Optional[str] = None,
     ):
         self.api_key = (api_key or settings.t212_api_key or "").strip()
         self.api_secret = (api_secret or settings.t212_api_secret or "").strip()
         self.base_url = (base_url or settings.t212_base_url).rstrip("/")
+        account_key = hashlib.sha256(f"{self.base_url}:{self.api_key}".encode()).hexdigest()[:16]
+        self.journal_path = journal_path or f"data/order_submissions_{account_key}.sqlite"
 
         # Bezpečnostní pojistka proti záměně prostředí
-        if settings.trading_mode == "demo" and "demo.trading212.com" not in self.base_url:
-            raise ValueError("Kritická chyba: TRADING_MODE je 'demo', ale base_url nesměřuje na demo!")
+        expected_host = "live.trading212.com" if settings.trading_mode == TradingMode.LIVE else "demo.trading212.com"
+        parsed = urlparse(self.base_url)
+        if parsed.scheme != "https" or parsed.netloc != expected_host or parsed.path not in ("", "/"):
+            raise ValueError("Broker URL neodpovídá zvolenému obchodnímu prostředí.")
+        if settings.trading_mode == TradingMode.LIVE:
+            settings.validate_live_mode()
 
         self.session = requests.Session()
         self.session.headers.update({
@@ -55,6 +65,9 @@ class Trading212Client:
         retries: int = 3
     ) -> Any:
         url = f"{self.base_url}{endpoint}"
+        # A timeout on a write does not establish whether the broker accepted it.
+        # Only reads may be retried automatically.
+        retries = max(1, retries) if method.upper() == "GET" else 1
 
         for attempt in range(1, retries + 1):
             try:
@@ -67,6 +80,8 @@ class Trading212Client:
                 )
 
                 if response.status_code == 429:
+                    if attempt == retries:
+                        raise Trading212APIError(status_code=429, message="Trading 212 rate limit překročen.")
                     raw_retry = response.headers.get("Retry-After")
                     retry_after = max(2, int(raw_retry)) if raw_retry and raw_retry.isdigit() else (2 * attempt)
                     logger.warning(f"Rate limit hit (429). Čekám {retry_after}s... (pokus {attempt}/{retries})")
@@ -135,7 +150,24 @@ class Trading212Client:
 
     def get_portfolio(self) -> List[Dict[str, Any]]:
         """Vrátí všechny aktuálně otevřené pozice."""
-        return self._request("GET", "/api/v0/equity/portfolio")
+        try:
+            result = self._request("GET", "/api/v0/equity/positions")
+        except Trading212APIError as exc:
+            if exc.status_code != 404:
+                raise
+            result = self._request("GET", "/api/v0/equity/portfolio")
+        if not isinstance(result, list):
+            raise ValueError("Broker positions response must be a list.")
+        normalized = []
+        for item in result:
+            p = dict(item)
+            p["ticker"] = p.get("ticker") or p.get("instrument", {}).get("ticker")
+            if not p["ticker"] or "quantity" not in p:
+                raise ValueError("Incomplete broker position.")
+            if "averagePricePaid" in p:
+                p["averagePrice"] = p["averagePricePaid"]
+            normalized.append(p)
+        return normalized
 
     def get_positions(self) -> List[Dict[str, Any]]:
         """Alias pro get_portfolio() pro kompatibilitu napříč strategiemi."""
@@ -147,12 +179,7 @@ class Trading212Client:
 
     def get_open_position(self, ticker: str) -> Optional[Dict[str, Any]]:
         """Vrátí detail konkrétní pozice podle tickeru."""
-        try:
-            return self._request("GET", f"/api/v0/equity/portfolio/{ticker}")
-        except Trading212APIError as exc:
-            if exc.status_code == 404:
-                return None
-            raise
+        return next((p for p in self.get_portfolio() if p["ticker"] == ticker), None)
 
     def place_order(
         self,
@@ -174,21 +201,12 @@ class Trading212Client:
         if side:
             order_qty = abs(quantity) if str(side).upper() in ("BUY", "ORDERSIDE.BUY") else -abs(quantity)
 
-        try:
-            return self.place_market_order(
-                ticker=t212_ticker,
-                quantity=order_qty,
-                extended_hours=extended_hours,
-            )
-        except Trading212APIError as exc:
-            if extended_hours:
-                logger.info(f"Extended hours order failed ({exc}), falling back to regular hours for {t212_ticker}")
-                return self.place_market_order(
-                    ticker=t212_ticker,
-                    quantity=order_qty,
-                    extended_hours=False,
-                )
-            raise
+        if order_type.upper() != "MARKET":
+            raise ValueError("Tato metoda podporuje pouze MARKET pokyny.")
+        if side and str(side).upper() not in ("BUY", "SELL", "ORDERSIDE.BUY", "ORDERSIDE.SELL"):
+            raise ValueError("Neplatný směr pokynu.")
+        extra = {"context": kwargs["context"]} if "context" in kwargs else {}
+        return self.place_market_order(t212_ticker, order_qty, extended_hours=extended_hours, **extra)
 
     def place_market_order(
         self,
@@ -196,46 +214,63 @@ class Trading212Client:
         quantity: float,
         extended_hours: bool = False,
         _precision_retry: bool = False,
+        context: Optional[Dict[str, Any]] = None,
     ) -> Dict[str, Any]:
         """
         Zadá nákupní nebo prodejní market příkaz.
         Kladná quantity = BUY, záporná quantity = SELL.
         """
-        if quantity == 0:
+        if not math.isfinite(quantity) or quantity == 0:
             raise ValueError("Množství (quantity) nemůže být 0.")
 
+        from decimal import Decimal, ROUND_DOWN
+        quantity = float(Decimal(str(quantity)).quantize(Decimal("0.000001"), rounding=ROUND_DOWN))
+        if quantity == 0:
+            raise ValueError("Quantity is below supported precision.")
         payload = {
-            "quantity": round(quantity, 6),
+            "quantity": quantity,
             "ticker": ticker,
         }
         if extended_hours:
             payload["extendedHours"] = True
 
+        if settings.trading_mode == TradingMode.BACKTEST:
+            raise RuntimeError("Backtest nesmí odesílat broker pokyny.")
+        from src.execution.submission_journal import SubmissionJournal
+        journal = SubmissionJournal(self.journal_path)
+        # Preserve uncertainty across crashes and concurrent client instances.
+        journal.reserve(ticker, payload, context=context)
+
         logger.info(f"Odesílám market order: {ticker} | množství: {quantity}")
         try:
-            return self._request("POST", "/api/v0/equity/orders/market", json_data=payload)
+            result = self._request("POST", "/api/v0/equity/orders/market", json_data=payload)
         except Trading212APIError as exc:
-            # Automatické zotavení při chybě quantity-precision-mismatch
-            if not _precision_retry and ("quantity-precision-mismatch" in str(exc) or "invalid quantity precision" in str(exc)):
-                import re
-                m = re.search(r"invalid quantity precision\s*(\d+)", str(exc))
-                if m:
-                    allowed_prec = int(m.group(1))
-                    new_qty = round(quantity, allowed_prec)
-                    if allowed_prec == 0:
-                        new_qty = float(round(quantity))
-                    if new_qty != 0:
-                        logger.warning(
-                            f"Quantity precision mismatch pro {ticker} (původní: {quantity}). "
-                            f"Automaticky upravuji na {allowed_prec} desetinných míst ({new_qty}) a opakuji příkaz."
-                        )
-                        return self.place_market_order(
-                            ticker=ticker,
-                            quantity=new_qty,
-                            extended_hours=extended_hours,
-                            _precision_retry=True,
-                        )
+            if 400 <= exc.status_code < 500 and exc.status_code != 408:
+                journal.reject(ticker)
             raise
+        broker_id = result.get("id", result.get("orderId")) if isinstance(result, dict) else None
+        if broker_id is not None:
+            journal.acknowledge(ticker, broker_id)
+        return result
+
+    def reconcile_submissions(self, history: Optional[List[Dict[str, Any]]] = None) -> int:
+        """Release known terminal submissions using broker history, never local prices.
+
+        UNKNOWN requests without a broker ID deliberately remain blocked.
+        """
+        from src.execution.submission_journal import SubmissionJournal
+        journal = SubmissionJournal(self.journal_path)
+        count = 0
+        for item in history if history is not None else self.get_all_order_history():
+            order = item.get("order", {})
+            ticker = order.get("ticker") or order.get("instrument", {}).get("ticker")
+            if ticker:
+                count += int(journal.reconcile_terminal(ticker, order))
+        return count
+
+    def get_submission_contexts(self) -> Dict[str, Any]:
+        from src.execution.submission_journal import SubmissionJournal
+        return SubmissionJournal(self.journal_path).contexts()
 
     def get_open_orders(self) -> List[Dict[str, Any]]:
         """Vrátí všechny čekající (nevyplněné) objednávky."""

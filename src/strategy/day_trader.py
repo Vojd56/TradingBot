@@ -361,6 +361,13 @@ class DayTraderEngine:
             allow_trading=self.current_regime_snapshot.allow_new_buys if self.current_regime_snapshot else True,
             risk_multiplier=1.0,
         )
+        if "vwap" not in df_5m.columns or "orb_high" not in df_5m.columns:
+            try:
+                from src.quant.features import CausalFeatureEngine
+                df_5m = CausalFeatureEngine.compute_intraday_features(df_5m)
+            except Exception as feat_err:
+                logger.debug(f"Chyba při výpočtu intradenních features pro {ticker}: {feat_err}")
+                return None
         sig = self.intraday_signal_engine.evaluate(df_5m, q_regime, ticker=ticker)
         if sig is None or sig.action != SignalAction.BUY:
             return None
@@ -431,6 +438,45 @@ class DayTraderEngine:
                     logger.info(f"📈 [TRAILING STOP POSUNUT] {ticker}: Nový Stop Loss {trailing_level:.2f} {curr} (High: {peak:.2f} {curr}).")
                     print(f"  📈 [TRAILING STOP] {ticker}: Nový SL: {trailing_level:.2f} {curr}")
 
+            # 2.5 Kontrola blížícího se konce seance (EOD Close ochrana před nočním držením)
+            if MarketHours.is_ticker_approaching_close(ticker, buffer_minutes=10):
+                msg = f"⏰ [EOD CLOSE] Blíží se konec seance pro {ticker}. Bezpečně uzavírám pozici ({pnl_pct:+.2f} %) před noční pauzou."
+                logger.info(msg)
+                print(f"  {msg}")
+                exit_sig = PositionExitSignal(
+                    ticker=ticker,
+                    should_exit=True,
+                    reason=ExitReason.TIME_STOP,
+                    exit_price=current_price,
+                    message=f"EOD výstup před koncem seance ({pnl_pct:+.2f} %)",
+                )
+                res = self.executor.execute_sell(ticker, exit_sig, pos.quantity)
+                if not res:
+                    logger.warning(f"⚠️ Prodejní příkaz EOD Close pro {ticker} nebyl brokerem potvrzen (res=None). Pozice zůstává otevřena.")
+                    continue
+
+                order_id = str(res.get("id", "dry_run" if self.dry_run else "broker_order"))
+                trade_pnl_eur = pos.allocated_eur * (pnl_pct / 100.0)
+                self._daily_realized_pnl_eur += trade_pnl_eur
+                self._session_trades_count += 1
+                if pnl_pct >= 0:
+                    self._session_wins += 1
+                    self._consecutive_losses = 0
+                else:
+                    self._consecutive_losses += 1
+
+                try:
+                    self.reflection_engine.reconcile_with_broker_api(self.client)
+                except Exception as rec_err:
+                    logger.debug(f"Chyba při rekonciliaci po EOD prodeji: {rec_err}")
+
+                closed_reports.append({"ticker": ticker, "reason": "TIME_STOP", "pnl_pct": pnl_pct, "res": res})
+                self._peak_prices.pop(ticker, None)
+                self._breakeven_applied.discard(ticker)
+                if ticker in self._dry_run_positions:
+                    del self._dry_run_positions[ticker]
+                continue
+
             # 3. Kontrola Take Profitu
             if current_price >= pos.take_profit_price:
                 msg = f"🎯 [TAKE PROFIT ZASAŽEN] {ticker}: Cena {current_price:.2f} >= TP {pos.take_profit_price:.2f} {curr} (+{pnl_pct:.2f} % zisk)!"
@@ -471,7 +517,7 @@ class DayTraderEngine:
                         entry_snapshot=snap,
                         regime_name=reg_name,
                     )
-                    refl.api_verified = True
+                    refl.api_verified = False  # Estimated/simulated reflection is not a broker fill.
                     refl.trade_id = f"{ticker}_{order_id}"
                 except Exception as refl_err:
                     logger.debug(f"Chyba při reflexi TP: {refl_err}")
@@ -527,7 +573,7 @@ class DayTraderEngine:
                         entry_snapshot=snap,
                         regime_name=reg_name,
                     )
-                    refl.api_verified = True
+                    refl.api_verified = False  # Estimated/simulated reflection is not a broker fill.
                     refl.trade_id = f"{ticker}_{order_id}"
                     print(f"  🧠 [AI POST-MORTEM CHYBY] {ticker} | {refl.mistake_category.value}: {refl.lesson_learned}")
                 except Exception as refl_err:
@@ -747,7 +793,14 @@ class DayTraderEngine:
         evaluated_signals: List[DayTradeSignal] = []
         for ticker, snap in snapshots.items():
             try:
-                sig = self.evaluate_snapshot(snap)
+                sig = None
+                # Prioritně zkusíme vyhodnotit z 5m svíček pomocí IntradaySignalEngine (pokud jsou data v bar store)
+                if self.data_provider.bar_store.has_bars(ticker, self.data_provider.interval):
+                    df_bars = self.data_provider.bar_store.load_bars(ticker, self.data_provider.interval)
+                    if df_bars is not None and len(df_bars) >= 5:
+                        sig = self.evaluate_intraday_dataframe(df_bars, ticker)
+                if sig is None:
+                    sig = self.evaluate_snapshot(snap)
                 evaluated_signals.append(sig)
             except Exception as exc:
                 logger.debug(f"Chyba při vyhodnocení {ticker}: {exc}")

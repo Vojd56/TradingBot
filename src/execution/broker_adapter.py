@@ -9,6 +9,7 @@ Definuje abstraktní vrstvu BrokerAdapter a konkrétní implementace:
 from abc import ABC, abstractmethod
 import logging
 import os
+import math
 from typing import Any, Dict, Optional
 
 from src.broker.t212_client import Trading212APIError, Trading212Client
@@ -60,11 +61,22 @@ class PaperBrokerAdapter(BrokerAdapter):
         return dict(self.positions)
 
     def place_order(self, order: ApprovedOrder) -> Dict[str, Any]:
+        if order.client_order_id in self.executed_orders:
+            previous = self.executed_orders[order.client_order_id]
+            if previous != order:
+                raise ValueError("Stejné ID má jiný obsah pokynu.")
+            return self._fill_response(previous)
+        if not order.approved or not math.isfinite(order.entry_price) or order.entry_price <= 0 or not math.isfinite(order.shares):
+            raise ValueError("Neplatný paper pokyn.")
         cost = order.shares * order.entry_price
         if order.side.upper() == "BUY":
+            if cost > self.cash:
+                raise ValueError("Nedostatek paper hotovosti.")
             self.cash -= cost
             self.positions[order.ticker] = self.positions.get(order.ticker, 0.0) + order.shares
         elif order.side.upper() == "SELL":
+            if order.shares > self.positions.get(order.ticker, 0.0):
+                raise ValueError("Paper prodej překračuje držené množství.")
             self.cash += cost
             cur_qty = self.positions.get(order.ticker, 0.0)
             new_qty = cur_qty - order.shares
@@ -72,12 +84,18 @@ class PaperBrokerAdapter(BrokerAdapter):
                 self.positions.pop(order.ticker, None)
             else:
                 self.positions[order.ticker] = new_qty
+        else:
+            raise ValueError("Neplatný směr pokynu.")
 
         self.executed_orders[order.client_order_id] = order
         logger.info(
             f"[PaperBroker] Exekuce {order.side} {order.shares} ks {order.ticker} "
             f"@ {order.entry_price:.2f} (client_order_id: {order.client_order_id})"
         )
+        return self._fill_response(order)
+
+    @staticmethod
+    def _fill_response(order: ApprovedOrder) -> Dict[str, Any]:
         return {
             "id": order.client_order_id,
             "status": "FILLED",
@@ -89,7 +107,7 @@ class PaperBrokerAdapter(BrokerAdapter):
         }
 
     def cancel_order(self, order_id: str) -> bool:
-        return bool(order_id in self.executed_orders)
+        return False  # Already filled simulated orders cannot be cancelled.
 
 
 class T212BrokerAdapter(BrokerAdapter):
@@ -107,7 +125,7 @@ class T212BrokerAdapter(BrokerAdapter):
             return float(cash_info.get("free", cash_info.get("total", 0.0)))
         except Exception as exc:
             logger.error(f"T212: Chyba při načítání hotovosti: {exc}")
-            return 0.0
+            raise
 
     def get_open_positions(self) -> Dict[str, float]:
         try:
@@ -121,17 +139,17 @@ class T212BrokerAdapter(BrokerAdapter):
             return res
         except Exception as exc:
             logger.error(f"T212: Chyba při načítání otevřených pozic: {exc}")
-            return {}
+            raise
 
     def place_order(self, order: ApprovedOrder) -> Dict[str, Any]:
         t212_ticker = TickerMapper.to_t212_ticker(order.ticker)
         qty = order.shares if order.side.upper() == "BUY" else -abs(order.shares)
 
         try:
-            try:
-                res = self.client.place_market_order(ticker=t212_ticker, quantity=qty, extended_hours=True)
-            except Trading212APIError:
-                res = self.client.place_market_order(ticker=t212_ticker, quantity=qty)
+            res = self.client.place_market_order(ticker=t212_ticker, quantity=qty, context={
+                "stop_loss": order.stop_loss, "take_profit": order.take_profit,
+                "strategy_id": getattr(order, "strategy_id", "SWING"),
+            })
 
             res["client_order_id"] = order.client_order_id
             return res

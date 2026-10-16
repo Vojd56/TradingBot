@@ -53,7 +53,8 @@ class PortfolioReconciler:
     def sync_broker_portfolio(self) -> List[Dict[str, Any]]:
         """Stáhne aktuální portfolio z Trading 212 a synchronizuje lokální stav."""
         broker_positions = self.client.get_portfolio()
-        self.tracker.sync_with_broker(broker_positions)
+        contexts = self.client.get_submission_contexts() if hasattr(self.client, "get_submission_contexts") else {}
+        self.tracker.sync_with_broker(broker_positions, contexts=contexts)
         return broker_positions
 
     def evaluate_and_close_positions(self) -> List[Dict[str, Any]]:

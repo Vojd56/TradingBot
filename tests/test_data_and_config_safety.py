@@ -181,19 +181,8 @@ class TestIntradayDataAndParquet(unittest.TestCase):
             index=pd.DatetimeIndex(dates),
         )
 
-        clean = validate_ohlcv_integrity(df_corrupt)
-
-        # 1. Duplikát odstraněn
-        self.assertEqual(len(clean), 2)
-
-        # 2. Geometrie opravena: High >= Low, High >= Open, High >= Close
-        for _, row in clean.iterrows():
-            self.assertGreaterEqual(row["High"], row["Low"])
-            self.assertGreaterEqual(row["High"], row["Open"])
-            self.assertGreaterEqual(row["High"], row["Close"])
-            self.assertLessEqual(row["Low"], row["Open"])
-            self.assertLessEqual(row["Low"], row["Close"])
-            self.assertGreaterEqual(row["Volume"], 0.0)
+        with self.assertRaises(ValueError):
+            validate_ohlcv_integrity(df_corrupt)
 
     def test_parquet_store_save_and_load(self):
         """Ověření uložení do Parquetu a rychlého opětovného načtení."""

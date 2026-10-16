@@ -186,11 +186,92 @@ def test_opportunity_scanner_and_intraday_signals():
     print(f"  [OK] OpportunityScanner Directional Bias: {bias:+.2f}")
 
 
+def test_daytrader_eod_close_and_intraday_dataframe():
+    """Ověření EOD výstupu z pozice před zavřením burzy a vyhodnocení 5m DataFrame."""
+    from datetime import datetime
+    from unittest.mock import MagicMock, patch
+    from zoneinfo import ZoneInfo
+    from src.strategy.day_trader import DayTraderEngine, PositionRecord
+    from src.strategy.intraday_data import IntradaySnapshot
+    from src.strategy.market_hours import MarketHours
+
+    # 1. Test detekce blížícího se konce seance (EOD)
+    mock_dt_close = datetime(2026, 3, 10, 15, 55, tzinfo=ZoneInfo("America/New_York"))
+    with patch("src.strategy.market_hours.datetime") as mock_d:
+        mock_d.now.return_value = mock_dt_close
+        mock_d.combine = datetime.combine
+        assert MarketHours.is_ticker_approaching_close("AAPL", buffer_minutes=10) is True
+
+    # 2. Test EOD exitu v audit_active_positions
+    engine = DayTraderEngine(dry_run=True)
+    engine.tracker.positions = {
+        "AAPL": PositionRecord(
+            ticker="AAPL",
+            t212_ticker="AAPL_US_EQ",
+            quantity=5.0,
+            entry_price_usd=100.0,
+            stop_loss_price=98.0,
+            take_profit_price=105.0,
+            allocated_eur=500.0,
+            status="OPEN",
+        )
+    }
+    snap = IntradaySnapshot(
+        ticker="AAPL",
+        current_price=101.0,
+        vwap=100.5,
+        is_above_vwap=True,
+        ema_9=101.0,
+        ema_21=100.8,
+        is_bullish_ema_cross=True,
+        is_fresh_cross=False,
+        rsi_5m=55.0,
+        volume_surge_ratio=1.2,
+        atr_5m=1.0,
+        high_30m=101.5,
+        low_30m=99.5,
+        is_breaking_high=False,
+        change_pct=1.0,
+        timestamp=datetime.now(),
+    )
+    engine.data_provider.fetch_intraday_snapshot = MagicMock(return_value=snap)
+    with patch.object(MarketHours, "is_ticker_approaching_close", return_value=True):
+        closed = engine.audit_active_positions()
+        assert len(closed) == 1
+        assert closed[0]["reason"] == "TIME_STOP"
+
+    # 3. Test evaluate_intraday_dataframe
+    df_bull = pd.DataFrame(
+        {
+            "Open": [100.0] * 5,
+            "High": [101.0, 101.5, 101.8, 101.2, 103.5],
+            "Low": [99.5, 99.8, 99.7, 100.0, 101.0],
+            "Close": [100.5, 101.2, 101.5, 101.0, 103.0],
+            "Volume": [10000] * 5,
+            "session": ["REGULAR"] * 5,
+            "minutes_from_open": [0, 5, 10, 15, 20],
+            "vwap": [100.8] * 5,
+            "orb_high": [np.nan, np.nan, np.nan, 101.8, 101.8],
+            "orb_low": [np.nan, np.nan, np.nan, 99.5, 99.5],
+            "orb_width": [np.nan, np.nan, np.nan, 2.3, 2.3],
+            "atr_14": [4.0] * 5,
+            "rvol_at_time": [1.0, 1.0, 1.0, 1.2, 1.9],
+            "intraday_rs_zscore": [0.5] * 5,
+        },
+        index=pd.date_range("2026-03-10 09:30", periods=5, freq="5min", tz="America/New_York"),
+    )
+    sig = engine.evaluate_intraday_dataframe(df_bull, "TSLA")
+    assert sig is not None
+    assert sig.action == SignalAction.BUY
+    assert sig.ticker == "TSLA"
+
+
 if __name__ == "__main__":
     try:
         test_risk_manager_logic()
         test_opportunity_scanner_and_intraday_signals()
         test_stock_picker_scoring()
+        test_daytrader_eod_close_and_intraday_dataframe()
         print("\n==========================================")
         print("  FÁZE 3 ÚSPĚŠNĚ DOKONČENA A OVĚŘENA")
         print("==========================================\n")

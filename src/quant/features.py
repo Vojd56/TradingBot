@@ -292,9 +292,12 @@ class CausalFeatureEngine:
         vwap = cum_pv / cum_vol.replace(0, np.nan)
 
         # Vážená směrodatná odchylka typické ceny od VWAP
-        dev = reg_tp - vwap
-        cum_sq_dev = (reg_vol * (dev ** 2)).groupby(reg_days).cumsum()
-        vwap_var = cum_sq_dev / cum_vol.replace(0, np.nan)
+        # Center on the session's first price to reduce cancellation error.
+        origin = reg_tp.groupby(reg_days).transform("first")
+        shifted = reg_tp - origin
+        mean_shift = (reg_vol * shifted).groupby(reg_days).cumsum() / cum_vol.replace(0, np.nan)
+        second_moment = (reg_vol * shifted.pow(2)).groupby(reg_days).cumsum() / cum_vol.replace(0, np.nan)
+        vwap_var = second_moment - mean_shift.pow(2)
         vwap_std = np.sqrt(np.maximum(0.0, vwap_var.fillna(0.0)))
 
         res.loc[reg, "vwap"] = vwap

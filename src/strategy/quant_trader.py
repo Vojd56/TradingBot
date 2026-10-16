@@ -23,10 +23,11 @@ from config import settings
 from src.broker.t212_client import Trading212Client
 from src.data.market_data import MarketDataProvider
 from src.execution.portfolio_tracker import PortfolioTracker
+from src.execution.ticker_mapper import TickerMapper
 from src.quant.execution_engine import ExecutionEngine, ExecutionOrder
 from src.quant.features import CausalFeatureEngine, StockFeatures
 from src.quant.monitoring import KillSwitchStatus, QuantMonitoringSystem
-from src.quant.prediction_model import ExpectedValueResult, PredictionModel
+from src.quant.prediction_model import ExpectedValueResult, PredictionModel, TripleBarriers
 from src.quant.regime_detector import MarketRegime, MarketRegimeType, RegimeDetector
 from src.quant.signal_engine import CarverSignalEngine, QuantSignal, SignalAction
 from src.quant.risk_engine import CarverRiskEngine, PositionSizingResult
@@ -73,6 +74,12 @@ class QuantTraderEngine:
         self.data_provider = data_provider or MarketDataProvider()
         self.tracker = tracker or PortfolioTracker()
         self.reflection_engine = TradeReflectionEngine()
+        self.ticker_mapper = TickerMapper()
+
+        # Sledování denního PnL a maximálního propadu (ATH) pro jističe
+        self.ath_equity: float = 0.0
+        self.daily_start_equity: Optional[float] = None
+        self.last_trading_day: Optional[str] = None
 
         # Inicializace 8 modulů kvantitativní architektury
         self.regime_detector = RegimeDetector()
@@ -157,10 +164,10 @@ class QuantTraderEngine:
             try:
                 acc_cash = self.client.get_account_cash()
                 summary = self.client.get_account_summary()
-                curr = summary.get("currency", "USD").upper()
+                curr = summary["currency"].upper()
 
-                raw_equity = float(acc_cash.get("total", 100_000.0))
-                raw_free_cash = float(acc_cash.get("free", raw_equity))
+                raw_equity = float(summary["totalValue"])
+                raw_free_cash = float(acc_cash["free"])
 
                 usd_mult = self.get_usd_multiplier(curr)
                 equity = raw_equity * usd_mult
@@ -181,9 +188,7 @@ class QuantTraderEngine:
                         positions[std_t] = qty
             except Exception as e:
                 logger.error(f"Chyba při stahování stavu z T212 API: {e}", exc_info=True)
-                # Použijeme tracker jako fallback
-                open_pos = self.tracker.get_open_positions()
-                positions = {t: rec.quantity for t, rec in open_pos.items()}
+                raise RuntimeError("Nelze ověřit účet; cyklus nesmí obchodovat.") from e
         else:
             # V dry-run režimu použijeme tracker
             open_pos = self.tracker.get_open_positions()
@@ -208,9 +213,20 @@ class QuantTraderEngine:
 
         # 1. Zjištění stavu účtu a kontrola jističů
         equity, free_cash, current_positions = self.get_portfolio_state()
+
+        today_str = now.strftime("%Y-%m-%d")
+        if self.last_trading_day != today_str or self.daily_start_equity is None or self.daily_start_equity <= 0:
+            self.last_trading_day = today_str
+            self.daily_start_equity = equity
+        if equity > self.ath_equity:
+            self.ath_equity = equity
+
+        daily_pnl_pct = ((equity - self.daily_start_equity) / self.daily_start_equity) * 100.0 if self.daily_start_equity > 0 else 0.0
+        drawdown_pct = ((self.ath_equity - equity) / self.ath_equity) * 100.0 if self.ath_equity > 0 else 0.0
+
         monitoring_status = self.monitoring.evaluate_all(
-            daily_pnl_pct=0.0,
-            portfolio_drawdown_from_ath_pct=0.0,
+            daily_pnl_pct=daily_pnl_pct,
+            portfolio_drawdown_from_ath_pct=drawdown_pct,
         )
 
         # 2. Analýza tržního režimu z benchmarku
@@ -234,16 +250,27 @@ class QuantTraderEngine:
                 orders_executed_count=0,
             )
 
-        # 3. Výpočet příznaků pro sledované univerzum
+        # 3. Výpočet příznaků a denních výnosů pro sledované univerzum
         features_map: Dict[str, StockFeatures] = {}
+        returns_map: Dict[str, pd.Series] = {}
         for ticker in self.watchlist:
             try:
                 df = self.data_provider.get_history(ticker, period="1y", interval="1d")
                 feat = CausalFeatureEngine.compute_single_ticker_features(df, ticker=ticker, min_bars_required=60)
                 if feat:
                     features_map[ticker] = feat
+                    if len(df) >= 2 and "Close" in df.columns:
+                        returns_map[ticker] = df["Close"].pct_change()
             except Exception as e:
                 logger.warning(f"{ticker}: Chyba při stahování dat/výpočtu příznaků: {e}")
+
+        # Výpočet mezititulové korelační matice univerza
+        corr_matrix: Dict[str, Dict[str, float]] = {}
+        if len(returns_map) >= 2:
+            try:
+                corr_matrix = pd.DataFrame(returns_map).dropna(how="all").corr().to_dict()
+            except Exception as e:
+                logger.debug(f"Nelze spočítat korelační matici: {e}")
 
         # 4. Průřezové řazení (Cross-sectional ranking)
         features_map = CausalFeatureEngine.compute_cross_sectional_ranks(features_map)
@@ -290,40 +317,93 @@ class QuantTraderEngine:
         pending_tickers: Set[str] = set()
         if not self.dry_run and self.client:
             try:
-                from src.execution.ticker_mapper import TickerMapper
                 open_orders = self.client.get_open_orders()
                 for o in open_orders:
                     raw_t = o.get("ticker", "")
                     if raw_t:
-                        pending_tickers.add(TickerMapper.to_standard_ticker(raw_t))
+                        pending_tickers.add(self.ticker_mapper.to_standard_ticker(raw_t))
             except Exception as e:
-                logger.debug(f"Nelze načíst čekající objednávky: {e}")
+                raise RuntimeError("Nelze ověřit čekající objednávky; nové pokyny zablokovány.") from e
 
-        # 7.2 Předvýběr aktivních kandidátů (vynechání čekajících a vetovaných pamětí chyb)
+        fx_rates = self.get_market_fx_rates()
+
+        # 7.1.5 Správa a ochrana stávajících otevřených pozic (Stop Loss, Take Profit, Sell signál)
+        contexts = self.client.get_submission_contexts() if (self.client and hasattr(self.client, "get_submission_contexts")) else {}
+        for held_ticker, held_qty in list(current_positions.items()):
+            if held_qty <= 0:
+                continue
+            feat = features_map.get(held_ticker)
+            if not feat:
+                continue
+            raw_t212 = self.ticker_mapper.to_t212_ticker(held_ticker)
+            ctx = contexts.get(raw_t212) or contexts.get(held_ticker) or {}
+            sl_price = ctx.get("stop_loss")
+            tp_price = ctx.get("take_profit")
+            cur_price = feat.current_price
+
+            exit_reason = None
+            if sl_price and cur_price <= sl_price:
+                exit_reason = f"STOP_LOSS (Cena {cur_price:.2f} <= SL {sl_price:.2f})"
+            elif tp_price and cur_price >= tp_price:
+                exit_reason = f"TAKE_PROFIT (Cena {cur_price:.2f} >= TP {tp_price:.2f})"
+            elif held_ticker in signals and signals[held_ticker].action in (SignalAction.CLOSE, SignalAction.SELL):
+                exit_reason = f"SIGNAL_SELL ({signals[held_ticker].rationale})"
+
+            if exit_reason:
+                logger.info(f"🛑 [QUANT EXIT] {held_ticker}: {exit_reason}. Odesílám prodej {held_qty} ks...")
+                exit_sizing = PositionSizingResult(
+                    ticker=held_ticker,
+                    target_shares=0.0,
+                    target_value=0.0,
+                    portfolio_weight_pct=0.0,
+                    risk_per_trade_cash=0.0,
+                    risk_per_trade_pct=0.0,
+                    current_shares=held_qty,
+                    shares_diff=-held_qty,
+                    is_rebalance_required=True,
+                    approved_for_execution=True,
+                    rationale=exit_reason,
+                )
+                exit_barriers = TripleBarriers(
+                    entry_price=cur_price,
+                    take_profit_price=cur_price * 1.04,
+                    stop_loss_price=cur_price * 0.98,
+                    max_holding_bars=1,
+                    take_profit_pct=4.0,
+                    stop_loss_pct=2.0,
+                    rr_ratio=2.0,
+                )
+                exit_order = self.execution_engine.execute_sizing_order(
+                    sizing=exit_sizing,
+                    barriers=exit_barriers,
+                    available_cash=0.0,
+                    timestamp=now,
+                    fx_rates=fx_rates,
+                )
+                if exit_order:
+                    executed_orders.append(exit_order)
+                    current_positions[held_ticker] = 0.0
+
+        # 7.2 Předvýběr aktivních kandidátů (vynechání čekajících a korelační filtr)
         active_candidates: List[str] = []
+        candidate_corr_multipliers: Dict[str, float] = {}
+
         for ticker in qualifying_buys:
             if ticker in pending_tickers:
                 logger.info(f"{ticker}: Na brokerovi již čeká nevyřízený příkaz, vynechávám duplicitní objednávku.")
                 continue
 
-            ev = ev_results[ticker]
-            feat = features_map[ticker]
-            vwap_proxy = feat.current_price / max(1e-4, (1.0 + feat.mean_reversion_z_20 * 0.01))
-            reflection_check = self.reflection_engine.check_candidate_against_memory(
-                ticker=ticker,
-                current_price=feat.current_price,
-                rsi_5m=50.0 + feat.mean_reversion_z_20 * 10.0,
-                vwap=vwap_proxy,
-                score=ev.ev_net_pct * 30.0,
-            )
-            if not reflection_check.get("approved", True):
-                logger.warning(f"🚫 [VETO - Paměť chyb Qwen] Obchod pro {ticker} byl zablokován: {reflection_check.get('reason')}")
+            # Korelační ochrana portfolia: vyloučení silně korelovaných aktiv s existujícími pozicemi
+            held_tickers = [t for t, qty in current_positions.items() if qty > 0 and t != ticker]
+            corr_mult = self.risk_engine.evaluate_correlation(ticker, held_tickers, corr_matrix)
+            if corr_mult == 0.0:
+                logger.info(f"🚫 [KORELACE VETO] {ticker}: Příliš vysoká korelace (> 0.80) s drženými pozicemi ({held_tickers}). Obchod zablokován.")
                 continue
 
             active_candidates.append(ticker)
+            candidate_corr_multipliers[ticker] = corr_mult
 
         # 7.3 Dimenzování a exekuce s férovým rozdělením hotovosti
-        fx_rates = self.get_market_fx_rates()
         remaining_cash = free_cash
         remaining_candidates_count = len(active_candidates)
 
@@ -349,7 +429,8 @@ class QuantTraderEngine:
             # Férové rozdělení dostupné hotovosti mezi zbývající schválené kandidáty
             budget_for_candidate = usable_cash / max(1, remaining_candidates_count)
 
-            # Výpočet cílové velikosti pozice s normalizovanými cenami v USD
+            # Výpočet cílové velikosti pozice s normalizovanými cenami v USD a korelační penalizací
+            corr_penalty = candidate_corr_multipliers.get(ticker, 1.0)
             sizing = self.risk_engine.calculate_position_size(
                 ev_result=ev,
                 features=feat,
@@ -357,6 +438,7 @@ class QuantTraderEngine:
                 portfolio_equity=equity,
                 current_shares=curr_shares,
                 available_cash=budget_for_candidate,
+                correlation_penalty_multiplier=corr_penalty,
                 fx_rates=fx_rates,
             )
             sizing_results[ticker] = sizing
@@ -372,7 +454,7 @@ class QuantTraderEngine:
                 )
                 if order:
                     executed_orders.append(order)
-                    if order.status == "FILLED" and str(order.side).upper() in ("BUY", "ORDERSIDE.BUY"):
+                    if order.status in ("FILLED", "SUBMITTED", "UNKNOWN") and str(order.side).upper() in ("BUY", "ORDERSIDE.BUY"):
                         share_price_usd = CarverRiskEngine.get_share_price_usd(ticker, ev.barriers.entry_price, fx_rates)
                         cost_usd = order.quantity * share_price_usd
 
@@ -383,7 +465,7 @@ class QuantTraderEngine:
                                 summary = self.client.get_account_summary()
                                 curr = summary.get("currency", "USD").upper()
                                 usd_mult = self.get_usd_multiplier(curr)
-                                remaining_cash = float(acc_cash.get("free", 0.0)) * usd_mult
+                                remaining_cash = min(max(0.0, remaining_cash - cost_usd), float(acc_cash["free"]) * usd_mult)
                                 logger.debug(f"Aktualizována volná hotovost z API brokera: {remaining_cash:.2f} USD")
                             except Exception as e:
                                 logger.debug(f"Nelze obnovit hotovost z API, použita kalkulace: {e}")

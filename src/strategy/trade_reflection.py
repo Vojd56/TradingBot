@@ -2,6 +2,7 @@ from datetime import datetime
 from enum import Enum
 import json
 import logging
+import math
 from pathlib import Path
 import re
 import time
@@ -30,7 +31,13 @@ class TradeLogEntry(BaseModel):
     gross_amount: float
     fees: float
     realized_pnl: float
-    realized_pnl_percent: float
+    realized_pnl_percent: Optional[float]
+    fill_id: Optional[str] = None
+    timestamp: Optional[str] = None
+    currency: Optional[str] = None
+    gross_currency: Optional[str] = None
+    net_amount: Optional[float] = None
+    fees_complete: bool = False
     api_verified: bool = True
     notes: str = ""
 
@@ -68,6 +75,8 @@ class TradeReflectionRecord(BaseModel):
     prevention_rule: Dict[str, Any] = Field(default_factory=dict)
     llm_used: bool = False
     api_verified: bool = False
+    broker_order_id: Optional[str] = None
+    broker_fill_id: Optional[str] = None
     created_at: str = Field(default_factory=lambda: datetime.now().isoformat())
 
 
@@ -517,101 +526,95 @@ class TradeReflectionEngine:
         open_portfolio = client.get_portfolio()
         history_orders = client.get_all_order_history()
 
-        # 1. Zpracování všech exekuovaných příkazů z API
-        orders_sorted = sorted(history_orders, key=lambda x: x.get("fill", {}).get("filledAt", ""))
+        # Validate the complete account snapshot before modifying local state.
+        total_equity = float(summary["totalValue"])
+        free_cash = float(cash["free"])
+        investments = summary["investments"]
+        invested = float(investments["currentValue"])
+        realized_pnl = float(investments["realizedProfitLoss"])
+        unrealized_pnl = float(investments["unrealizedProfitLoss"])
+        curr = summary["currency"]
+        if not all(math.isfinite(v) for v in (total_equity, free_cash, invested, realized_pnl, unrealized_pnl)):
+            raise ValueError("Non-finite broker account snapshot.")
 
-        verified_logs: List[TradeLogEntry] = []
-        api_order_ids: Set[str] = set()
-        total_fees = 0.0
-
-        for item in orders_sorted:
-            ord_info = item.get("order", {}) or {}
-            fill_info = item.get("fill", {}) or {}
-            side = ord_info.get("side")
-            raw_ticker = ord_info.get("ticker", "")
-            std_ticker = TickerMapper.to_standard_ticker(raw_ticker)
-            order_id = str(ord_info.get("id"))
-            api_order_ids.add(order_id)
-
-            qty = abs(float(fill_info.get("quantity", 0.0)))
-            price = float(fill_info.get("price", 0.0))
-            filled_at = fill_info.get("filledAt", "")
-            wallet_impact = fill_info.get("walletImpact", {}) or {}
-            gross = float(wallet_impact.get("netValue", 0.0))
-            taxes = wallet_impact.get("taxes", []) or []
-            fee = sum(abs(float(t.get("quantity", 0.0))) for t in taxes)
-            total_fees += fee
-
-            if side == "SELL":
-                pnl = float(wallet_impact.get("realisedProfitLoss", 0.0))
-                cost_basis = gross - pnl
-                pnl_pct = (pnl / cost_basis * 100.0) if cost_basis > 0 else 0.0
-                fill_id = fill_info.get("id", "")
-                verified_logs.append(TradeLogEntry(
-                    order_id=order_id,
-                    asset=std_ticker,
-                    direction="SELL",
-                    execution_price=price,
-                    quantity=qty,
-                    gross_amount=round(gross, 2),
-                    fees=round(fee, 2),
-                    realized_pnl=round(pnl, 2),
-                    realized_pnl_percent=round(pnl_pct, 2),
+        # Retain previously verified fills: a paginated window is not all history.
+        logs_by_fill = {t.fill_id: t for t in self.trade_logs if t.fill_id and t.timestamp and t.api_verified}
+        invalid = {str(r.get("record_id")): r for r in self.invalid_unverified_records}
+        for item in history_orders:
+            order = item.get("order") or {}
+            fill = item.get("fill") or {}
+            if not fill:
+                continue  # Unfilled/cancelled order is not an executed trade.
+            try:
+                if fill.get("type") != "TRADE":
+                    continue  # Corporate actions need separate accounting.
+                order_id = str(order["id"])
+                fill_id = str(fill["id"])
+                side = order["side"]
+                raw_ticker = order.get("ticker") or order["instrument"]["ticker"]
+                qty = abs(float(fill["quantity"]))
+                price = float(fill["price"])
+                filled_at = fill["filledAt"]
+                parsed_time = datetime.fromisoformat(filled_at.replace("Z", "+00:00"))
+                wallet = fill["walletImpact"]
+                wallet_currency = wallet["currency"]
+                net = float(wallet["netValue"])
+                taxes = wallet["taxes"]
+                fee = sum(abs(float(t["quantity"])) for t in taxes)
+                pnl = float(wallet["realisedProfitLoss"]) if side == "SELL" else 0.0
+                if side not in ("BUY", "SELL") or qty <= 0 or price <= 0 or parsed_time.tzinfo is None:
+                    raise ValueError("Invalid fill identity, quantity, price or timestamp.")
+                if not all(math.isfinite(v) for v in (qty, price, net, fee, pnl)) or wallet_currency != curr:
+                    raise ValueError("Invalid fill amounts or account currency mismatch.")
+                # Gross is in instrument currency; net and PnL in wallet currency.
+                # No invented cost basis or percentage is derived from netValue.
+                instrument_currency = order.get("instrument", {}).get("currency") or order.get("currency")
+                logs_by_fill[fill_id] = TradeLogEntry(
+                    order_id=order_id, fill_id=fill_id,
+                    asset=TickerMapper.to_standard_ticker(raw_ticker), direction=side,
+                    execution_price=price, quantity=qty, gross_amount=qty * price,
+                    gross_currency=instrument_currency, currency=wallet_currency,
+                    net_amount=net, fees=fee, fees_complete=False,
+                    realized_pnl=pnl, realized_pnl_percent=None, timestamp=filled_at,
                     api_verified=True,
-                    notes=f"Potvrzeno burzou T212 (Fill ID: {fill_id}, Filled: {filled_at})"
-                ))
+                    notes="Broker TRADE fill; fees contain reported taxes only; total fee completeness unknown."
+                )
+            except (KeyError, TypeError, ValueError) as exc:
+                key = f"fill:{fill.get('id', order.get('id', 'unknown'))}"
+                invalid[key] = {"record_id": key, "status": "[INVALID/UNVERIFIED]", "reason": str(exc)}
 
-        # 2. Identifikace a invalidace neověřených / simulovaných záznamů
-        new_invalid_records = []
+        verified_logs = sorted(logs_by_fill.values(), key=lambda t: t.timestamp)
         valid_reflections = []
         for ref in self.reflections:
-            if not getattr(ref, "api_verified", False):
-                new_invalid_records.append({
-                    "record_id": ref.trade_id,
-                    "ticker": ref.ticker,
-                    "claimed_pnl_eur": ref.pnl_eur,
-                    "claimed_pnl_pct": ref.pnl_pct,
-                    "status": "[INVALID/UNVERIFIED - SIMULATED LOOP ARTIFACT]",
-                    "reason": "Chybí oficiální exekuce v historii příkazů brokera (Order ID nenalezeno v T212 API).",
-                    "flagged_at": datetime.now().isoformat()
-                })
-            else:
+            source = logs_by_fill.get(ref.broker_fill_id)
+            if source and ref.broker_order_id == source.order_id and source.asset == ref.ticker:
                 valid_reflections.append(ref)
-
-        self.invalid_unverified_records = new_invalid_records
+            else:
+                key = str(ref.trade_id)
+                invalid[key] = {"record_id": key, "ticker": ref.ticker,
+                    "status": "[INVALID/UNVERIFIED]", "reason": "Reflection lacks matching broker fill provenance.",
+                    "original_record": ref.model_dump(mode="json")}
+        self.invalid_unverified_records = list(invalid.values())
         self.reflections = valid_reflections
         self.trade_logs = verified_logs
-
-        # 3. Přepočet oficiálních účetních metrik přímo z API
-        total_equity = float(summary.get("totalValue", 0.0))
-        free_cash = float(cash.get("free", 0.0))
-        invested = float(cash.get("invested", 0.0))
-        realized_pnl = float(cash.get("result", 0.0))
-        unrealized_pnl = float(cash.get("ppl", 0.0))
-        curr = summary.get("currency", "CZK")
-
-        wins = sum(1 for t in verified_logs if t.realized_pnl >= 0.0)
-        losses = sum(1 for t in verified_logs if t.realized_pnl < 0.0)
-        win_rate = (wins / len(verified_logs) * 100.0) if verified_logs else 0.0
-
+        sells = [t for t in verified_logs if t.direction == "SELL"]
+        wins = sum(t.realized_pnl > 0 for t in sells)
+        losses = sum(t.realized_pnl < 0 for t in sells)
+        win_rate = wins / len(sells) * 100 if sells else 0.0
+        total_fees = sum(t.fees for t in verified_logs)
         self.account_metrics = {
-            "currency": curr,
-            "total_account_equity": round(total_equity, 2),
-            "free_cash": round(free_cash, 2),
-            "invested_value": round(invested, 2),
-            "realized_pnl": round(realized_pnl, 2),
-            "unrealized_pnl": round(unrealized_pnl, 2),
-            "total_fees_paid": round(total_fees, 2),
-            "total_closed_trades": len(verified_logs),
-            "winning_trades": wins,
-            "losing_trades": losses,
-            "win_rate_percent": round(win_rate, 1),
+            "currency": curr, "total_account_equity": total_equity,
+            "free_cash": free_cash, "invested_value": invested,
+            "realized_pnl": realized_pnl, "unrealized_pnl": unrealized_pnl,
+            "reported_taxes_paid": total_fees, "fees_complete": False,
+            "verified_fill_count": len(verified_logs), "sell_fill_count": len(sells),
+            "winning_sell_fills": wins, "losing_sell_fills": losses,
+            "sell_fill_win_rate_percent": win_rate,
             "open_positions_count": len(open_portfolio),
             "last_reconciliation": datetime.now().isoformat(),
         }
-
         # 4. Generování ponaučení pouze z reálných ztrát
-        self._generate_lessons_from_real_losses(verified_logs)
+        # No automated causal lessons without the actual entry context.
 
         self._save_memory()
         logger.info(

@@ -64,8 +64,8 @@ class PortfolioTracker:
                 "positions": {t: rec.model_dump() for t, rec in self.positions.items()},
                 "trade_history": self.trade_history,
             }
-            with open(self.storage_path, "w", encoding="utf-8") as f:
-                json.dump(payload, f, indent=2, ensure_ascii=False)
+            from src.execution.state_io import write_json_atomic
+            write_json_atomic(self.storage_path, payload)
         except Exception as exc:
             logger.error(f"Chyba při ukládání stavu portfolia do {self.storage_path}: {exc}")
 
@@ -154,11 +154,18 @@ class PortfolioTracker:
         )
         return record
 
-    def sync_with_broker(self, broker_positions: List[Dict[str, Any]]) -> None:
+    def sync_with_broker(
+        self,
+        broker_positions: List[Dict[str, Any]],
+        contexts: Optional[Dict[str, Any]] = None,
+    ) -> None:
         """
         Synchronizuje lokální evidenci s reálným portfoliem na brokerovi.
+        Pokud jsou k dispozici kontexty z žurnálu příkazů, obnoví původní SL/TP.
         """
         broker_tickers = set()
+        ctx_map = contexts or {}
+
         for p in broker_positions:
             raw_t212 = p.get("ticker", "")
             std_ticker = TickerMapper.to_standard_ticker(raw_t212)
@@ -168,9 +175,10 @@ class PortfolioTracker:
             if std_ticker not in self.positions or self.positions[std_ticker].status != "OPEN":
                 qty = float(p.get("quantity", 0.0))
                 avg_price = float(p.get("averagePrice", p.get("currentPrice", 0.0)))
-                # Odhad defaultních stops (+/- 10%)
-                sl = round(avg_price * 0.90, 2)
-                tp = round(avg_price * 1.15, 2)
+                # Zjištění skutečných SL/TP z uloženého kontextu, případně konzervativní fallback
+                c = ctx_map.get(raw_t212) or ctx_map.get(std_ticker) or {}
+                sl = float(c.get("stop_loss", round(avg_price * 0.90, 2)))
+                tp = float(c.get("take_profit", round(avg_price * 1.15, 2)))
                 self.positions[std_ticker] = PositionRecord(
                     ticker=std_ticker,
                     t212_ticker=raw_t212,
@@ -181,7 +189,7 @@ class PortfolioTracker:
                     allocated_eur=16.67,
                     status="OPEN",
                 )
-                logger.info(f"Synchronizována externí pozice brokera: {std_ticker} ({qty} ks)")
+                logger.info(f"Synchronizována externí pozice brokera: {std_ticker} ({qty} ks, SL: {sl}, TP: {tp})")
 
         # Pokud máme otevřenou pozici, kterou broker již nemá (byla např. manuálně prodána v aplikaci)
         for ticker, record in list(self.positions.items()):

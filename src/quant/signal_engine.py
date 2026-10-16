@@ -29,6 +29,7 @@ class SignalAction(str, Enum):
     HOLD = "HOLD"
     NO_TRADE = "NO_TRADE"
     CLOSE = "CLOSE"
+    SELL = "SELL"
 
 
 class QuantSignal(BaseModel):

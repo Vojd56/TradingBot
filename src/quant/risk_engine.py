@@ -433,6 +433,15 @@ class RiskGatekeeper:
         Hlavní brána: prověří záměr a vydá ApprovedOrder nebo RejectedOrder.
         """
         now = datetime.now()
+        side = intent.side.upper()
+        values = [intent.entry_price, intent.stop_loss_price, portfolio.cash, portfolio.equity,
+                  portfolio.daily_realized_pnl, portfolio.daily_unrealized_pnl]
+        if intent.desired_shares is not None:
+            values.append(intent.desired_shares)
+        if intent.take_profit_price is not None:
+            values.append(intent.take_profit_price)
+        if side not in ("BUY", "SELL") or not all(math.isfinite(v) for v in values) or intent.entry_price <= 0:
+            return RejectedOrder(ticker=intent.ticker, side=intent.side, reason="INVALID_INPUT", rejected_at=now)
 
         # 1. KONTROLA ZASTARALOSTI DAT (STALE DATA GUARD)
         if market_bar is not None and market_bar.timestamp is not None:
@@ -447,7 +456,7 @@ class RiskGatekeeper:
 
         # 2. DENNÍ KILL-SWITCH (MAX DAILY LOSS GUARD)
         daily_total_pnl = portfolio.daily_realized_pnl + portfolio.daily_unrealized_pnl
-        if portfolio.equity > 0:
+        if side == "BUY" and portfolio.equity > 0:
             daily_loss_pct = daily_total_pnl / portfolio.equity
             if daily_loss_pct <= -self.max_daily_loss_pct:
                 reason = (
@@ -467,6 +476,11 @@ class RiskGatekeeper:
             pos_val = portfolio.open_positions[intent.ticker]
             cur_held = float(pos_val.get("shares", pos_val.get("quantity", 0.0))) if isinstance(pos_val, dict) else float(pos_val)
             shares_to_sell = intent.desired_shares if intent.desired_shares and intent.desired_shares > 0 else cur_held
+            if not math.isfinite(cur_held) or cur_held <= 0 or shares_to_sell > cur_held or (intent.desired_shares is not None and intent.desired_shares <= 0):
+                return RejectedOrder(ticker=intent.ticker, side=intent.side, reason="SELL_EXCEEDS_POSITION", rejected_at=now)
+            shares_to_sell = math.floor(shares_to_sell * 10000) / 10000
+            if shares_to_sell <= 0:
+                return RejectedOrder(ticker=intent.ticker, side=intent.side, reason="SELL_BELOW_PRECISION", rejected_at=now)
 
             order_id = self.generate_client_order_id(
                 ticker=intent.ticker,
@@ -498,6 +512,11 @@ class RiskGatekeeper:
                 notes="Schválený prodejní pokyn",
             )
 
+        if portfolio.cash <= 0 or portfolio.equity <= 0:
+            return RejectedOrder(ticker=intent.ticker, side=intent.side, reason="INSUFFICIENT_FUNDS_OR_RISK", rejected_at=now)
+        if intent.desired_shares is not None and intent.desired_shares <= 0:
+            return RejectedOrder(ticker=intent.ticker, side=intent.side, reason="INVALID_QUANTITY", rejected_at=now)
+
         # 4. LIMIT SOUČASNÝCH POZIC (MAX CONCURRENT POSITIONS GUARD)
         is_new_position = intent.ticker not in portfolio.open_positions
         if is_new_position and portfolio.open_positions_count >= self.max_concurrent_positions:
@@ -516,12 +535,19 @@ class RiskGatekeeper:
             return RejectedOrder(ticker=intent.ticker, side=intent.side, reason=reason, rejected_at=now)
 
         # 6. VÝPOČET VELIKOSTI POZICE (VOLATILITY TARGETING & RISK BUDGET)
+        if intent.take_profit_price is not None and intent.take_profit_price - intent.entry_price < 2 * price_risk - 1e-9:
+            return RejectedOrder(ticker=intent.ticker, side=intent.side, reason="REWARD_RISK_BELOW_TWO", rejected_at=now)
         # Q = floor( (Equity * max_risk_per_trade_pct) / |Entry - SL| )
         risk_budget_cash = portfolio.equity * self.max_risk_per_trade_pct
         q_risk = math.floor(risk_budget_cash / price_risk)
 
         # Koncentrační strop (max 20 % kapitálu)
         max_notional = portfolio.equity * self.max_position_notional_pct
+        existing = portfolio.open_positions.get(intent.ticker, 0.0)
+        held = float(existing.get("shares", existing.get("quantity", 0.0))) if isinstance(existing, dict) else float(existing)
+        if not math.isfinite(held) or held < 0:
+            return RejectedOrder(ticker=intent.ticker, side=intent.side, reason="INVALID_POSITION", rejected_at=now)
+        max_notional = max(0.0, max_notional - held * intent.entry_price)
         q_notional = math.floor(max_notional / intent.entry_price)
         target_shares = min(q_risk, q_notional)
 
@@ -530,9 +556,8 @@ class RiskGatekeeper:
             target_shares = min(target_shares, math.floor(intent.desired_shares))
 
         # Kontrola dostupné hotovosti
-        if portfolio.cash > 0:
-            max_cash_shares = math.floor(portfolio.cash / intent.entry_price)
-            target_shares = min(target_shares, max_cash_shares)
+        max_cash_shares = math.floor(portfolio.cash / intent.entry_price)
+        target_shares = min(target_shares, max_cash_shares)
 
         if target_shares <= 0:
             reason = f"INSUFFICIENT_FUNDS_OR_RISK: Vypočtené množství pro {intent.ticker} je 0 ks."

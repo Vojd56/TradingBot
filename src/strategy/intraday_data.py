@@ -1,6 +1,8 @@
 from dataclasses import dataclass
 from datetime import date, datetime
 import logging
+import os
+import tempfile
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 import numpy as np
@@ -11,79 +13,37 @@ logger = logging.getLogger(__name__)
 
 
 def validate_ohlcv_integrity(df: pd.DataFrame) -> pd.DataFrame:
+    """Reject corrupt market data instead of manufacturing prices or volume.
+
+    Sorting is lossless. Missing fields, ambiguous timestamps and invalid candle
+    geometry are errors; the caller must skip/quarantine the affected dataset.
     """
-    Validuje integritu OHLCV svíček a odstraňuje poškozená data:
-    1. Odstranění duplicitních časových razítek (ponechá první výskyt).
-    2. Seřazení chronologicky podle indexu.
-    3. Oprava a kontrola geometrie svíček: Low <= Open, Close <= High.
-    4. Ošetření záporných a chybějících objemů (clip(lower=0.0)).
-    5. Doplnění a zachování povinných sloupců (Open, High, Low, Close, Volume).
-    """
+    required = ["Open", "High", "Low", "Close", "Volume"]
     if df is None or df.empty:
-        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
-
-    clean_df = df.copy()
-
-    # Normalizace názvů sloupců (Open, High, Low, Close, Volume)
-    col_map = {}
-    for col in clean_df.columns:
-        c_lower = str(col).lower()
-        if c_lower == "open":
-            col_map[col] = "Open"
-        elif c_lower == "high":
-            col_map[col] = "High"
-        elif c_lower == "low":
-            col_map[col] = "Low"
-        elif c_lower == "close":
-            col_map[col] = "Close"
-        elif c_lower in ("volume", "vol"):
-            col_map[col] = "Volume"
-
-    if col_map:
-        clean_df = clean_df.rename(columns=col_map)
-
-    # Zajištění povinných sloupců
-    required_cols = ["Open", "High", "Low", "Close", "Volume"]
-    for col in required_cols:
-        if col not in clean_df.columns:
-            if col == "Volume":
-                clean_df["Volume"] = 0.0
-            elif "Close" in clean_df.columns:
-                clean_df[col] = clean_df["Close"]
-            else:
-                clean_df[col] = 100.0
-
-    # Zajištění DatetimeIndexu
-    if not isinstance(clean_df.index, pd.DatetimeIndex):
-        date_cols = [c for c in clean_df.columns if str(c).lower() in ("datetime", "date", "timestamp", "time")]
-        if date_cols:
-            clean_df[date_cols[0]] = pd.to_datetime(clean_df[date_cols[0]])
-            clean_df = clean_df.set_index(date_cols[0])
-        else:
-            clean_df.index = pd.to_datetime(clean_df.index)
-
-    # 1. Odstranění duplicitních časových razítek
-    clean_df = clean_df[~clean_df.index.duplicated(keep="first")]
-
-    # 2. Seřazení chronologicky
-    clean_df = clean_df.sort_index()
-
-    # 3. Kontrola geometrie svíček (Low <= Open, Close <= High)
-    o = clean_df["Open"].astype(float)
-    h = clean_df["High"].astype(float)
-    l = clean_df["Low"].astype(float)
-    c = clean_df["Close"].astype(float)
-
-    clean_df["High"] = np.maximum(h, np.maximum(o, np.maximum(c, l)))
-    clean_df["Low"] = np.minimum(l, np.minimum(o, np.minimum(c, h)))
-    clean_df["Open"] = o
-    clean_df["Close"] = c
-
-    # 4. Objem nesmí být záporný
-    clean_df["Volume"] = clean_df["Volume"].fillna(0.0).clip(lower=0.0).astype(float)
-
-    return clean_df
-
+        return pd.DataFrame(columns=required)
+    clean = df.copy()
+    names = {name.lower(): name for name in required}
+    names["vol"] = "Volume"
+    clean = clean.rename(columns={c: names.get(str(c).lower(), c) for c in clean.columns})
+    if clean.columns.duplicated().any() or any(c not in clean for c in required):
+        raise ValueError("Missing or duplicated OHLCV columns.")
+    if not isinstance(clean.index, pd.DatetimeIndex):
+        date_cols = [c for c in clean if str(c).lower() in ("datetime", "date", "timestamp", "time")]
+        if not date_cols:
+            raise ValueError("OHLCV requires explicit timestamps, not a numeric index.")
+        clean = clean.set_index(pd.to_datetime(clean[date_cols[0]], errors="raise"))
+    if clean.index.hasnans or clean.index.has_duplicates:
+        raise ValueError("Invalid or duplicated OHLCV timestamps.")
+    values = clean[required].astype(float)
+    if not np.isfinite(values.to_numpy()).all():
+        raise ValueError("Non-finite OHLCV values.")
+    if (values[["Open", "High", "Low", "Close"]] <= 0).any().any() or (values["Volume"] < 0).any():
+        raise ValueError("Non-positive prices or negative volume.")
+    if ((values["High"] < values[["Open", "Close", "Low"]].max(axis=1)) |
+            (values["Low"] > values[["Open", "Close", "High"]].min(axis=1))).any():
+        raise ValueError("Invalid OHLCV candle geometry.")
+    clean[required] = values
+    return clean.sort_index()
 
 class ParquetBarStore:
     """
@@ -128,13 +88,24 @@ class ParquetBarStore:
                 # Sloučení a deduplikace indexu (novější data přepisují starší při shodě)
                 merged_df = pd.concat([existing_df, validated_df])
                 merged_df = merged_df[~merged_df.index.duplicated(keep="last")].sort_index()
-                merged_df.to_parquet(file_path, engine="pyarrow", compression="snappy")
+                self._atomic_write(file_path, validate_ohlcv_integrity(merged_df))
                 return file_path
             except Exception as e:
-                logger.warning(f"Chyba při čtení existujícího {file_path} ({e}), ukládám přímým zápisem.")
+                raise ValueError(f"Existující data {file_path} nelze bezpečně sloučit; soubor zachován.") from e
 
-        validated_df.to_parquet(file_path, engine="pyarrow", compression="snappy")
+        self._atomic_write(file_path, validated_df)
         return file_path
+
+    @staticmethod
+    def _atomic_write(file_path: Path, df: pd.DataFrame) -> None:
+        fd, temporary = tempfile.mkstemp(dir=file_path.parent, suffix=".parquet.tmp")
+        os.close(fd)
+        try:
+            df.to_parquet(temporary, engine="pyarrow", compression="snappy")
+            os.replace(temporary, file_path)
+        finally:
+            if os.path.exists(temporary):
+                os.unlink(temporary)
 
     def load_bars(
         self,
@@ -222,12 +193,19 @@ class IntradayDataProvider:
             return None
 
         try:
+            df = validate_ohlcv_integrity(df)
+            # Yahoo intraday timestamps denote bar starts. Only complete bars.
+            if df.index.tz is None:
+                raise ValueError("Intraday data requires a timezone.")
+            interval_minutes = {"1m": 1, "2m": 2, "5m": 5, "15m": 15, "30m": 30, "60m": 60, "90m": 90, "1h": 60}[self.interval]
+            df = df[df.index + pd.Timedelta(minutes=interval_minutes) <= pd.Timestamp.now(tz="UTC")]
+            if len(df) < 5:
+                return None
             # 1. Výpočet VWAP (Volume-Weighted Average Price)
-            typical_price = (df['High'] + df['Low'] + df['Close']) / 3.0
-            cum_vol = df['Volume'].cumsum()
-            cum_vol_price = (typical_price * df['Volume']).cumsum()
-            vwap_series = cum_vol_price / cum_vol.replace(0, np.nan)
-            current_vwap = float(vwap_series.iloc[-1])
+            from src.quant.features import CausalFeatureEngine
+            current_vwap = float(CausalFeatureEngine.compute_session_vwap(df)["vwap"].iloc[-1])
+            if not np.isfinite(current_vwap):
+                return None
 
             # 2. EMA 9 a EMA 21 (Scalp Ribbon)
             ema_9_series = df['Close'].ewm(span=9, adjust=False).mean()
@@ -288,7 +266,7 @@ class IntradayDataProvider:
                 low_30m=round(low_30m, 2),
                 is_breaking_high=is_breaking_high,
                 change_pct=round(change_pct, 2),
-                timestamp=datetime.now(),
+                timestamp=(df.index[-1] + pd.Timedelta(minutes=interval_minutes)).to_pydatetime(),
             )
         except Exception as exc:
             logger.debug(f"[Intraday Data] Chyba výpočtu indikátorů pro {ticker}: {exc}")

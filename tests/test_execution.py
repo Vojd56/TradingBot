@@ -308,11 +308,12 @@ def test_trading212_client_compatibility_methods():
         client._request = fake_request
         client.place_market_order = original_method  # obnovit reálnou metodu
         try:
-            res_prec = client.place_market_order("RIOl_EQ", 0.4418)
-            assert res_prec["id"] == "RETRY_PRECISION_OK"
-            assert res_prec["quantity"] == 0.442
-            assert len(calls) == 2
-            print("  [OK] Trading212Client place_market_order automaticky zotavil quantity-precision-mismatch na 3 desetinná místa (0.442).")
+            import pytest
+            from src.broker.t212_client import Trading212APIError
+            with pytest.raises(Trading212APIError):
+                client.place_market_order("RIOl_EQ", 0.4418)
+            assert len(calls) == 1
+            assert calls[0]["quantity"] == 0.4418
         finally:
             client._request = orig_request
     finally:

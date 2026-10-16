@@ -13,6 +13,8 @@ class SignalAction(str, Enum):
 class ExitReason(str, Enum):
     STOP_LOSS = "STOP_LOSS"
     TAKE_PROFIT = "TAKE_PROFIT"
+    TIME_STOP = "TIME_STOP"
+    EOD = "EOD"
     TREND_BREAK = "TREND_BREAK"
     AI_AVOID = "AI_AVOID"
     ALPHA_ROTATION = "ALPHA_ROTATION"

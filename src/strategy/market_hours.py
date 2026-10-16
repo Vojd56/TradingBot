@@ -121,6 +121,30 @@ class MarketHours:
         return cls.is_us_market_open()
 
     @classmethod
+    def is_ticker_approaching_close(cls, ticker: str, buffer_minutes: int = 10) -> bool:
+        """
+        Zjistí, zda se blíží konec obchodní seance pro daný ticker (buffer_minutes před zavřením burzy).
+        Evropské burzy (.DE, .PA, .AS, .L, .MC, .MI, .SW): zavírají v 17:30 CET.
+        Americké burzy: zavírají v 16:00 NY (22:00 CET).
+        """
+        upper = ticker.upper()
+        is_eu = any(upper.endswith(sfx) for sfx in [".DE", ".PA", ".AS", ".L", ".MC", ".MI", ".SW"])
+        if is_eu:
+            now_local = datetime.now(LOCAL_TZ)
+            if now_local.weekday() >= 5:
+                return False
+            close_dt = datetime.combine(now_local.date(), cls.EU_CLOSE_TIME, tzinfo=LOCAL_TZ)
+            cutoff_dt = close_dt - timedelta(minutes=buffer_minutes)
+            return cutoff_dt <= now_local <= close_dt
+        else:
+            now_ny = datetime.now(NY_TZ)
+            if now_ny.weekday() >= 5:
+                return False
+            close_dt = datetime.combine(now_ny.date(), cls.US_CLOSE_TIME, tzinfo=NY_TZ)
+            cutoff_dt = close_dt - timedelta(minutes=buffer_minutes)
+            return cutoff_dt <= now_ny <= close_dt
+
+    @classmethod
     def get_time_until_open(cls) -> timedelta:
         """Vrátí čas zbývající do příštího otevření kteréhokoliv trhu."""
         now_local = datetime.now(LOCAL_TZ)

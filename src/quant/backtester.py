@@ -18,6 +18,7 @@ from datetime import datetime
 from enum import Enum
 import logging
 import math
+import copy
 from typing import Any, Callable, Dict, List, Optional
 import numpy as np
 import pandas as pd
@@ -77,14 +78,14 @@ class BacktestResult(BaseModel):
     winning_trades: int
     losing_trades: int
     win_rate: float
-    profit_factor: float
+    profit_factor: Optional[float]
     avg_trade_pnl: float
     avg_trade_bps: float
     avg_r_multiple: float
     max_drawdown_pct: float
     max_drawdown_cash: float
-    sharpe_ratio: float
-    sortino_ratio: float
+    sharpe_ratio: Optional[float]
+    sortino_ratio: Optional[float]
     trades: List[TradeRecord] = []
     equity_curve: List[float] = []
 
@@ -220,7 +221,7 @@ class IntradayBacktester:
 
                     # Výpočet velikosti pozice podle rizika
                     risk_per_share = entry_price - sl_val
-                    if risk_per_share > 0:
+                    if risk_per_share > 0 and tp_val > entry_price and sl_val > 0:
                         dollar_risk = current_equity * self.max_risk_per_trade_pct
                         target_shares = math.floor(dollar_risk / risk_per_share)
                         # Omezení maximální alokace na pozici
@@ -233,7 +234,7 @@ class IntradayBacktester:
                             shares = math.floor(current_cash / entry_price)
 
                         if shares > 0:
-                            entry_cost = shares * entry_price * cost_pct
+                            entry_cost = shares * raw_entry * cost_pct
                             current_cash -= shares * entry_price
                             active_pos = ActivePosition(
                                 symbol=symbol,
@@ -258,29 +259,29 @@ class IntradayBacktester:
                 raw_exit_price = 0.0
 
                 # 2A: Vynucený EOD Flatten (15:55 EST nebo konec dne)
-                if is_eod_bar:
-                    exit_triggered = True
-                    exit_reason = ExitReason.EOD_FLATTEN
-                    raw_exit_price = cur_close
-
                 # 2B: Pesimistická kontrola SL a TP kolize
-                elif cur_low <= active_pos.stop_loss and cur_high >= active_pos.take_profit:
+                if cur_low <= active_pos.stop_loss and cur_high >= active_pos.take_profit:
                     # Obě bariéry zasaženy v téže svíčce -> pesimisticky STOP LOSS
                     exit_triggered = True
                     exit_reason = ExitReason.STOP_LOSS
-                    raw_exit_price = active_pos.stop_loss
+                    raw_exit_price = min(cur_open, active_pos.stop_loss)
 
                 # 2C: Zasažení Stop Lossu
                 elif cur_low <= active_pos.stop_loss:
                     exit_triggered = True
                     exit_reason = ExitReason.STOP_LOSS
-                    raw_exit_price = active_pos.stop_loss
+                    raw_exit_price = min(cur_open, active_pos.stop_loss)
 
                 # 2D: Zasažení Take Profitu
                 elif cur_high >= active_pos.take_profit:
                     exit_triggered = True
                     exit_reason = ExitReason.TAKE_PROFIT
                     raw_exit_price = active_pos.take_profit
+
+                elif is_eod_bar:
+                    exit_triggered = True
+                    exit_reason = ExitReason.EOD_FLATTEN
+                    raw_exit_price = cur_close
 
                 # 2E: Time-Stop po vypršení max holding bars
                 elif active_pos.holding_bars >= self.max_holding_bars:
@@ -362,6 +363,7 @@ class IntradayBacktester:
             final_cap=current_equity,
             trades=trades,
             equity_curve=equity_curve,
+            equity_timestamps=list(df_sim.index),
         )
 
     def _empty_result(self, symbol: str) -> BacktestResult:
@@ -381,8 +383,8 @@ class IntradayBacktester:
             avg_r_multiple=0.0,
             max_drawdown_pct=0.0,
             max_drawdown_cash=0.0,
-            sharpe_ratio=0.0,
-            sortino_ratio=0.0,
+            sharpe_ratio=None,
+            sortino_ratio=None,
             trades=[],
             equity_curve=[self.initial_capital],
         )
@@ -394,6 +396,7 @@ class IntradayBacktester:
         final_cap: float,
         trades: List[TradeRecord],
         equity_curve: List[float],
+        equity_timestamps: Optional[List[Any]] = None,
     ) -> BacktestResult:
         net_pnl = final_cap - initial_cap
         net_return_pct = (net_pnl / initial_cap) * 100.0
@@ -408,7 +411,7 @@ class IntradayBacktester:
 
         gross_profit = sum(t.net_pnl for t in winning)
         gross_loss = abs(sum(t.net_pnl for t in losing))
-        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else (99.0 if gross_profit > 0 else 0.0)
+        profit_factor = (gross_profit / gross_loss) if gross_loss > 0 else None
 
         avg_trade_pnl = net_pnl / n_trades
         avg_trade_bps = float(np.mean([t.net_return_pct * 100.0 for t in trades]))
@@ -422,19 +425,19 @@ class IntradayBacktester:
         max_dd_pct = float(np.max(dd_pct)) if len(dd_pct) > 0 else 0.0
         max_dd_cash = float(np.max(dd_cash)) if len(dd_cash) > 0 else 0.0
 
-        # Sharpe & Sortino Ratio z procentuálních výnosů jednotlivých obchodů
-        rets = np.array([t.net_return_pct / 100.0 for t in trades])
-        std_ret = float(np.std(rets)) if len(rets) > 1 else 0.0
-        mean_ret = float(np.mean(rets)) if len(rets) > 0 else 0.0
-
-        # Odhad annualizovaného Sharpe (předpoklad cca 4 obchody denně * 252 dní = 1000 obchodů/rok)
-        annual_factor = np.sqrt(min(1000, max(252, n_trades * 10)))
-        sharpe = (mean_ret / std_ret * annual_factor) if std_ret > 1e-6 else 0.0
-
-        # Downside deviation pro Sortino
-        neg_rets = rets[rets < 0]
-        downside_std = float(np.std(neg_rets)) if len(neg_rets) > 1 else (std_ret if std_ret > 0 else 0.0)
-        sortino = (mean_ret / downside_std * annual_factor) if downside_std > 1e-6 else sharpe
+        # Daily marked-to-market equity returns; zero risk-free/MAR assumption.
+        # Trade count is not a clock and must never determine annualization.
+        sharpe = sortino = None
+        if equity_timestamps is not None and len(equity_timestamps) == len(equity_curve) - 1:
+            timed = pd.Series(equity_curve[1:], index=pd.DatetimeIndex(equity_timestamps))
+            daily = timed.groupby(timed.index.date).last().to_numpy(dtype=float)
+            rets = daily / np.r_[initial_cap, daily[:-1]] - 1.0
+            if len(rets) >= 2:
+                std_ret = float(np.std(rets, ddof=1))
+                downside = float(np.sqrt(np.mean(np.minimum(rets, 0.0) ** 2)))
+                mean_ret = float(np.mean(rets))
+                sharpe = mean_ret / std_ret * np.sqrt(252) if std_ret > 1e-12 else None
+                sortino = mean_ret / downside * np.sqrt(252) if downside > 1e-12 else None
 
         return BacktestResult(
             symbol=symbol,
@@ -446,14 +449,14 @@ class IntradayBacktester:
             winning_trades=len(winning),
             losing_trades=len(losing),
             win_rate=round(win_rate, 2),
-            profit_factor=round(min(99.0, profit_factor), 2),
+            profit_factor=round(profit_factor, 2) if profit_factor is not None else None,
             avg_trade_pnl=round(avg_trade_pnl, 2),
             avg_trade_bps=round(avg_trade_bps, 2),
             avg_r_multiple=round(avg_r, 2),
             max_drawdown_pct=round(max_dd_pct, 2),
             max_drawdown_cash=round(max_dd_cash, 2),
-            sharpe_ratio=round(sharpe, 2),
-            sortino_ratio=round(sortino, 2),
+            sharpe_ratio=round(sharpe, 2) if sharpe is not None else None,
+            sortino_ratio=round(sortino, 2) if sortino is not None else None,
             trades=trades,
             equity_curve=equity_curve,
         )
@@ -483,6 +486,7 @@ class WalkForwardEvaluator:
         df: pd.DataFrame,
         signal_generator_fn: Callable[[pd.DataFrame], pd.Series],
         symbol: str = "STOCK",
+        fit_fn: Optional[Callable] = None,
     ) -> Dict[str, Any]:
         """
         Provede rolling walk-forward rozdělení a agreguje výsledky výhradně z Out-of-Sample oken.
@@ -493,32 +497,17 @@ class WalkForwardEvaluator:
 
         window_size = self.in_sample_days + self.embargo_days + self.out_of_sample_days
 
-        # Pokud je dat méně než plná délka oken, dynamicky adaptujeme velikost pro test
+        if total_days < window_size:
+            raise ValueError(f"Insufficient sessions for walk-forward: {total_days} < {window_size}")
         is_days = self.in_sample_days
         emb_days = self.embargo_days
         oos_days = self.out_of_sample_days
-
-        if total_days < window_size:
-            if total_days >= 4:
-                is_days = max(2, total_days // 2)
-                emb_days = 1 if total_days >= 5 else 0
-                oos_days = max(1, total_days - is_days - emb_days)
-            else:
-                logger.warning(f"Nedostatek dnů ({total_days}) pro Walk-Forward evaluaci.")
-                # Provedeme alespoň přímý backtest na dostupných datech
-                signals = signal_generator_fn(df_tagged)
-                res = self.backtester.run(df_tagged, signals=signals, symbol=symbol)
-                return {
-                    "summary": res.to_dict(),
-                    "oos_trades_count": res.total_trades,
-                    "bootstrap_95_ci": self._bootstrap_ci([t.net_return_pct for t in res.trades]),
-                    "folds_count": 1,
-                }
-
         step = oos_days
         start_idx = 0
         all_oos_trades: List[TradeRecord] = []
         folds_details = []
+        combined_equity = [self.backtester.initial_capital]
+        combined_timestamps = []
 
         while start_idx + is_days + emb_days + oos_days <= total_days:
             is_end = start_idx + is_days
@@ -531,9 +520,17 @@ class WalkForwardEvaluator:
             # Slice pro Out-of-Sample okno
             oos_df = df_tagged[df_tagged["trading_day"].isin(oos_day_list)].copy()
             if not oos_df.empty:
-                # Generování signálu čistě na OOS datech
-                oos_signals = signal_generator_fn(oos_df)
-                fold_result = self.backtester.run(oos_df, signals=oos_signals, symbol=symbol)
+                train_df = df_tagged[df_tagged["trading_day"].isin(in_sample_day_list)].copy()
+                generator = fit_fn(train_df) if fit_fn is not None else signal_generator_fn
+                # Warm-up is allowed; only OOS bars are executable. Generator
+                # must be causal (verify prefix invariance separately).
+                context = df_tagged[df_tagged["trading_day"].isin(unique_days[start_idx:oos_end])].copy()
+                oos_signals = generator(context).reindex(oos_df.index)
+                fold_engine = copy.copy(self.backtester)
+                fold_engine.initial_capital = combined_equity[-1]
+                fold_result = fold_engine.run(oos_df, signals=oos_signals, symbol=symbol)
+                combined_equity.extend(fold_result.equity_curve[1:] if fold_result.total_trades else [fold_result.final_capital] * len(oos_df))
+                combined_timestamps.extend(oos_df.index)
                 all_oos_trades.extend(fold_result.trades)
                 folds_details.append({
                     "fold_index": len(folds_details) + 1,
@@ -544,21 +541,25 @@ class WalkForwardEvaluator:
                     "oos_trades": fold_result.total_trades,
                     "oos_win_rate": fold_result.win_rate,
                     "oos_net_pnl": fold_result.net_pnl,
+                    "training_applied": fit_fn is not None,
                 })
 
             start_idx += step
 
         # Agregace všech Out-of-Sample obchodů
-        oos_returns = [t.net_return_pct for t in all_oos_trades]
+        timed_equity = pd.Series(combined_equity[1:], index=pd.DatetimeIndex(combined_timestamps))
+        day_equity = timed_equity.groupby(timed_equity.index.date).last().to_numpy()
+        oos_returns = list((day_equity / np.r_[self.backtester.initial_capital, day_equity[:-1]] - 1) * 100)
         bootstrap_stats = self._bootstrap_ci(oos_returns)
 
         # Výpočet kombinovaných OOS metrik
         combined_result = self.backtester._calculate_metrics(
             symbol=symbol,
             initial_cap=self.backtester.initial_capital,
-            final_cap=self.backtester.initial_capital + sum(t.net_pnl for t in all_oos_trades),
+            final_cap=combined_equity[-1],
             trades=all_oos_trades,
-            equity_curve=[self.backtester.initial_capital + sum(t.net_pnl for t in all_oos_trades[:i+1]) for i in range(len(all_oos_trades))] or [self.backtester.initial_capital],
+            equity_curve=combined_equity,
+            equity_timestamps=combined_timestamps,
         )
 
         return {
@@ -567,18 +568,22 @@ class WalkForwardEvaluator:
             "folds": folds_details,
             "oos_trades_count": len(all_oos_trades),
             "bootstrap_95_ci": bootstrap_stats,
+            "validation_type": "walk_forward_fit" if fit_fn is not None else "fixed_rule_oos_windows",
         }
 
     def _bootstrap_ci(self, returns: List[float]) -> Dict[str, float]:
         """Výpočet 95% konfidenčního intervalu průměrného výnosu přes parametrický/neparametrický bootstrap."""
         if len(returns) < 5:
-            return {"mean": round(float(np.mean(returns)), 4) if returns else 0.0, "ci_lower": 0.0, "ci_upper": 0.0}
+            return {"mean": round(float(np.mean(returns)), 4) if returns else None, "ci_lower": None, "ci_upper": None}
 
         arr = np.array(returns)
-        np.random.seed(42)
+        rng = np.random.default_rng(42)
+        block_length = max(1, int(np.sqrt(len(arr))))
         boot_means = []
         for _ in range(self.n_bootstrap):
-            sample = np.random.choice(arr, size=len(arr), replace=True)
+            starts = rng.integers(0, len(arr), size=math.ceil(len(arr) / block_length))
+            indices = np.concatenate([(s + np.arange(block_length)) % len(arr) for s in starts])[:len(arr)]
+            sample = arr[indices]
             boot_means.append(float(np.mean(sample)))
 
         lower = float(np.percentile(boot_means, 2.5))
