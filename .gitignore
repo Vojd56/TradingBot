@@ -33,3 +33,5 @@ transcript*
 .idea/
 *.swp
 *.swo
+*.exe
+*.winmd

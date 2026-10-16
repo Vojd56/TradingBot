@@ -5,7 +5,7 @@ from pathlib import Path
 # Zajisteni importu z korene repozitare
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
-from config import settings
+from config import TradingMode, settings
 from src.broker.t212_client import Trading212Client
 from src.execution import (
     OrderExecutor,
@@ -65,8 +65,8 @@ def test_portfolio_tracker():
 
 def test_safety_guards():
     print("\n--- [3] Test Bezpečnostních Pojistek ---")
-    # Ověříme, že v aktuální konfiguraci běžíme v demo režimu
-    assert settings.trading_mode == "demo", "Test musí běžet v demo režimu!"
+    # Ověříme, že v aktuální konfiguraci běžíme v demo/paper režimu
+    assert settings.trading_mode in (TradingMode.PAPER, "demo", "paper"), "Test musí běžet v demo/paper režimu!"
     executor = OrderExecutor()
     print("  [OK] OrderExecutor bezpečně zkontroloval DEMO režim.")
 

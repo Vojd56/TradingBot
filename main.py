@@ -22,7 +22,7 @@ import time
 from typing import Any, Dict, Optional
 import schedule
 
-from config import settings
+from config import TradingMode, settings
 from src.broker.t212_client import Trading212Client
 from src.data.market_data import MarketDataProvider
 from src.execution import (
@@ -558,7 +558,13 @@ def main():
     parser.add_argument(
         "--dry-run",
         action="store_true",
-        help="Simuluje rozhodování i exekuci bez odesílání skutečných příkazů na brokera.",
+        help="Simuluje rozhodování i exekuci bez odesílání skutečných příkazů na brokera (přepne do PAPER režimu).",
+    )
+    parser.add_argument(
+        "--mode",
+        choices=["backtest", "paper", "live"],
+        default=None,
+        help="Provozní režim bota: backtest, paper, nebo live. Výchozí je PAPER.",
     )
     parser.add_argument(
         "--status",
@@ -636,6 +642,16 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Nastavení provozního režimu (BACKTEST, PAPER, LIVE)
+    if args.mode:
+        settings.trading_mode = TradingMode(args.mode)
+    if args.dry_run:
+        settings.trading_mode = TradingMode.PAPER
+
+    # Tvrdá bezpečnostní kontrola: pokud je vybrán LIVE, ověřit potvrzení
+    if settings.trading_mode == TradingMode.LIVE:
+        settings.validate_live_mode()
 
     if args.quant_trader:
         engine = QuantTraderEngine(

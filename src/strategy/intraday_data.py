@@ -1,12 +1,186 @@
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import date, datetime
 import logging
-from typing import Dict, List, Optional
+from pathlib import Path
+from typing import Any, Dict, List, Optional, Union
 import numpy as np
 import pandas as pd
 import yfinance as yf
 
 logger = logging.getLogger(__name__)
+
+
+def validate_ohlcv_integrity(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Validuje integritu OHLCV svíček a odstraňuje poškozená data:
+    1. Odstranění duplicitních časových razítek (ponechá první výskyt).
+    2. Seřazení chronologicky podle indexu.
+    3. Oprava a kontrola geometrie svíček: Low <= Open, Close <= High.
+    4. Ošetření záporných a chybějících objemů (clip(lower=0.0)).
+    5. Doplnění a zachování povinných sloupců (Open, High, Low, Close, Volume).
+    """
+    if df is None or df.empty:
+        return pd.DataFrame(columns=["Open", "High", "Low", "Close", "Volume"])
+
+    clean_df = df.copy()
+
+    # Normalizace názvů sloupců (Open, High, Low, Close, Volume)
+    col_map = {}
+    for col in clean_df.columns:
+        c_lower = str(col).lower()
+        if c_lower == "open":
+            col_map[col] = "Open"
+        elif c_lower == "high":
+            col_map[col] = "High"
+        elif c_lower == "low":
+            col_map[col] = "Low"
+        elif c_lower == "close":
+            col_map[col] = "Close"
+        elif c_lower in ("volume", "vol"):
+            col_map[col] = "Volume"
+
+    if col_map:
+        clean_df = clean_df.rename(columns=col_map)
+
+    # Zajištění povinných sloupců
+    required_cols = ["Open", "High", "Low", "Close", "Volume"]
+    for col in required_cols:
+        if col not in clean_df.columns:
+            if col == "Volume":
+                clean_df["Volume"] = 0.0
+            elif "Close" in clean_df.columns:
+                clean_df[col] = clean_df["Close"]
+            else:
+                clean_df[col] = 100.0
+
+    # Zajištění DatetimeIndexu
+    if not isinstance(clean_df.index, pd.DatetimeIndex):
+        date_cols = [c for c in clean_df.columns if str(c).lower() in ("datetime", "date", "timestamp", "time")]
+        if date_cols:
+            clean_df[date_cols[0]] = pd.to_datetime(clean_df[date_cols[0]])
+            clean_df = clean_df.set_index(date_cols[0])
+        else:
+            clean_df.index = pd.to_datetime(clean_df.index)
+
+    # 1. Odstranění duplicitních časových razítek
+    clean_df = clean_df[~clean_df.index.duplicated(keep="first")]
+
+    # 2. Seřazení chronologicky
+    clean_df = clean_df.sort_index()
+
+    # 3. Kontrola geometrie svíček (Low <= Open, Close <= High)
+    o = clean_df["Open"].astype(float)
+    h = clean_df["High"].astype(float)
+    l = clean_df["Low"].astype(float)
+    c = clean_df["Close"].astype(float)
+
+    clean_df["High"] = np.maximum(h, np.maximum(o, np.maximum(c, l)))
+    clean_df["Low"] = np.minimum(l, np.minimum(o, np.minimum(c, h)))
+    clean_df["Open"] = o
+    clean_df["Close"] = c
+
+    # 4. Objem nesmí být záporný
+    clean_df["Volume"] = clean_df["Volume"].fillna(0.0).clip(lower=0.0).astype(float)
+
+    return clean_df
+
+
+class ParquetBarStore:
+    """
+    Lokální sloupcové úložiště pro intradenní a denní OHLCV data v Parquet formátu.
+    Cesta: data/bars/{timeframe}/{symbol}.parquet
+    
+    Zajišťuje bleskové načtení (< 50 ms) a inkrementální ukládání stažených svíček.
+    """
+
+    def __init__(self, base_dir: Union[str, Path] = "data/bars"):
+        self.base_dir = Path(base_dir)
+        self.base_dir.mkdir(parents=True, exist_ok=True)
+
+    def _get_file_path(self, symbol: str, timeframe: str) -> Path:
+        clean_sym = symbol.strip().upper().replace("/", "_").replace("^", "_").replace(".", "_")
+        clean_tf = timeframe.strip().lower()
+        dir_path = self.base_dir / clean_tf
+        dir_path.mkdir(parents=True, exist_ok=True)
+        return dir_path / f"{clean_sym}.parquet"
+
+    def has_bars(self, symbol: str, timeframe: str) -> bool:
+        """Zjistí, zda existují uložená data pro daný symbol a timeframe."""
+        return self._get_file_path(symbol, timeframe).exists()
+
+    def save_bars(self, symbol: str, timeframe: str, df: pd.DataFrame) -> Path:
+        """
+        Uloží nebo inkrementálně sloučí svíčky pro daný symbol.
+        Automaticky provádí validaci integrity svíček.
+        """
+        if df is None or df.empty:
+            raise ValueError(f"Nelze uložit prázdný DataFrame pro {symbol}.")
+
+        validated_df = validate_ohlcv_integrity(df)
+        file_path = self._get_file_path(symbol, timeframe)
+
+        if file_path.exists():
+            try:
+                existing_df = pd.read_parquet(file_path)
+                if not isinstance(existing_df.index, pd.DatetimeIndex):
+                    existing_df.index = pd.to_datetime(existing_df.index)
+
+                # Sloučení a deduplikace indexu (novější data přepisují starší při shodě)
+                merged_df = pd.concat([existing_df, validated_df])
+                merged_df = merged_df[~merged_df.index.duplicated(keep="last")].sort_index()
+                merged_df.to_parquet(file_path, engine="pyarrow", compression="snappy")
+                return file_path
+            except Exception as e:
+                logger.warning(f"Chyba při čtení existujícího {file_path} ({e}), ukládám přímým zápisem.")
+
+        validated_df.to_parquet(file_path, engine="pyarrow", compression="snappy")
+        return file_path
+
+    def load_bars(
+        self,
+        symbol: str,
+        timeframe: str,
+        start_date: Optional[Union[str, date, datetime]] = None,
+        end_date: Optional[Union[str, date, datetime]] = None,
+    ) -> Optional[pd.DataFrame]:
+        """
+        Načte svíčky z lokálního Parquet úložiště.
+        Volitelně filtruje podle start_date a end_date.
+        """
+        file_path = self._get_file_path(symbol, timeframe)
+        if not file_path.exists():
+            return None
+
+        try:
+            df = pd.read_parquet(file_path)
+            if not isinstance(df.index, pd.DatetimeIndex):
+                df.index = pd.to_datetime(df.index)
+
+            df = df.sort_index()
+
+            if start_date is not None:
+                ts_start = pd.to_datetime(start_date)
+                if df.index.tz is not None and ts_start.tzinfo is None:
+                    ts_start = ts_start.tz_localize(df.index.tz)
+                df = df[df.index >= ts_start]
+
+            if end_date is not None:
+                ts_end = pd.to_datetime(end_date)
+                if df.index.tz is not None and ts_end.tzinfo is None:
+                    ts_end = ts_end.tz_localize(df.index.tz)
+                df = df[df.index <= ts_end]
+
+            return df
+        except Exception as exc:
+            logger.error(f"Chyba při načítání Parquet dat z {file_path}: {exc}")
+            return None
+
+    def get_cached_symbols(self, timeframe: str) -> List[str]:
+        """Vrátí seznam všech symbolů uložených pro daný timeframe."""
+        dir_path = self.base_dir / timeframe.strip().lower()
+        if not dir_path.exists():
+            return []
+        return sorted([f.stem for f in dir_path.glob("*.parquet")])
 
 
 @dataclass
@@ -34,11 +208,13 @@ class IntradayDataProvider:
     """
     Stahuje a analyzuje intradenní svíčky (1m a 5m) pro day trading a scalping.
     Počítá VWAP, EMA Ribbon (9/21), 5m RSI, Volume Surge a ATR v reálném čase.
+    Integruje ParquetBarStore pro lokální caching.
     """
 
-    def __init__(self, interval: str = "5m", period: str = "2d"):
+    def __init__(self, interval: str = "5m", period: str = "2d", bar_store: Optional[ParquetBarStore] = None):
         self.interval = interval
         self.period = period
+        self.bar_store = bar_store or ParquetBarStore()
 
     def _compute_from_df(self, ticker: str, df: pd.DataFrame) -> Optional[IntradaySnapshot]:
         """Vypočítá technický profil (VWAP, EMA 9/21, RSI, Volume Surge, ATR) z DataFrame svíček."""
@@ -118,22 +294,34 @@ class IntradayDataProvider:
             logger.debug(f"[Intraday Data] Chyba výpočtu indikátorů pro {ticker}: {exc}")
             return None
 
-    def fetch_intraday_snapshot(self, ticker: str) -> Optional[IntradaySnapshot]:
+    def fetch_intraday_snapshot(self, ticker: str, use_cache: bool = False) -> Optional[IntradaySnapshot]:
         """Stáhne a spočítá kompletní intradenní technický profil pro jeden ticker."""
         clean = ticker.strip().upper()
-        try:
-            df = yf.download(clean, period=self.period, interval=self.interval, progress=False)
-            if df.empty or len(df) < 5:
+        df = None
+
+        if use_cache and self.bar_store.has_bars(clean, self.interval):
+            df = self.bar_store.load_bars(clean, self.interval)
+
+        if df is None or df.empty or len(df) < 5:
+            try:
+                df = yf.download(clean, period=self.period, interval=self.interval, progress=False)
+                if df.empty or len(df) < 5:
+                    return None
+
+                if isinstance(df.columns, pd.MultiIndex):
+                    df.columns = df.columns.get_level_values(0)
+
+                # Uložení do Parquet úložiště
+                try:
+                    self.bar_store.save_bars(clean, self.interval, df)
+                except Exception as save_exc:
+                    logger.debug(f"Nepodařilo se uložit data do cache pro {clean}: {save_exc}")
+
+            except Exception as exc:
+                logger.debug(f"[Intraday Data] Chyba při načítání 5m svíček pro {clean}: {exc}")
                 return None
 
-            # Zploštění multi-indexu u yfinance
-            if isinstance(df.columns, pd.MultiIndex):
-                df.columns = df.columns.get_level_values(0)
-
-            return self._compute_from_df(clean, df)
-        except Exception as exc:
-            logger.debug(f"[Intraday Data] Chyba při načítání 5m svíček pro {clean}: {exc}")
-            return None
+        return self._compute_from_df(clean, df)
 
     def fetch_batch_snapshots(self, tickers: List[str]) -> Dict[str, IntradaySnapshot]:
         """Rychlé paralelní stažení intradenních profilů pro celé široké univerzum (50-100 tickerů)."""
@@ -170,6 +358,11 @@ class IntradayDataProvider:
                     snap = self._compute_from_df(t, sub_df)
                     if snap:
                         results[snap.ticker] = snap
+                        # Uložení do cache
+                        try:
+                            self.bar_store.save_bars(t, self.interval, sub_df)
+                        except Exception:
+                            pass
                 except Exception as sub_exc:
                     logger.debug(f"Chyba při zpracování batch tickeru {t}: {sub_exc}")
 

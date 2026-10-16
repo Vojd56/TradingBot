@@ -280,7 +280,7 @@ Povolené hodnoty pro recommendation jsou výhradně: "BUY", "HOLD", "AVOID". Na
                 extracted["ticker"] = fallback_ticker
 
             # sentiment_score
-            m_score = re.search(r'"sentiment_score"\s*:\s*([+-]?\d+(?:\.\d+)?)', raw_text)
+            m_score = re.search(r'"sentiment_score"\s*:\s*["\s]*([+-]?\d+(?:\.\d+)?)', raw_text)
             if m_score:
                 extracted["sentiment_score"] = float(m_score.group(1))
             else:

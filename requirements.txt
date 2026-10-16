@@ -7,3 +7,5 @@ pandas>=2.2.0
 numpy>=1.26.0
 openai>=1.30.0
 schedule>=1.2.1
+pyarrow>=15.0.0
+pytest>=8.0.0

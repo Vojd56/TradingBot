@@ -69,6 +69,10 @@ class OrderExecutor:
 
         return rates
 
+    def get_eur_usd_rate(self) -> float:
+        """Vrátí aktuální kurz EUR/USD."""
+        return self.get_exchange_rates().get("EURUSD", 1.08)
+
     def execute_buy(self, signal: TradingSignal) -> Optional[Dict[str, Any]]:
         """
         Zadá nákupní příkaz na základě signálu a zaeviduje pozici.
