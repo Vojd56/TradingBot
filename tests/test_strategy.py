@@ -4,8 +4,12 @@ from pathlib import Path
 # Zajisteni importu z korene repozitare
 sys.path.insert(0, str(Path(__file__).resolve().parent.parent))
 
+import numpy as np
+import pandas as pd
 from src.data.market_data import TechnicalMetrics
 from src.llm.sentiment_engine import LLMStockVerdict
+from src.quant.regime_detector import MarketRegime, MarketRegimeType
+from src.quant.signal_engine import IntradaySignalEngine
 from src.strategy import (
     ExitReason,
     PositionExitSignal,
@@ -14,6 +18,7 @@ from src.strategy import (
     StockPicker,
     TradingSignal,
 )
+from src.strategy.opportunity_scanner import OpportunityScanner
 
 
 def test_risk_manager_logic():
@@ -144,9 +149,47 @@ def test_stock_picker_scoring():
         print(f"  Důvody:            {'; '.join(s.reasons)}")
 
 
+def test_opportunity_scanner_and_intraday_signals():
+    print("\n--- [3] Test OpportunityScanner a IntradaySignalEngine ---")
+    scanner = OpportunityScanner()
+    engine = IntradaySignalEngine()
+    regime = MarketRegime(
+        regime=MarketRegimeType.TRENDING_BULL,
+        allow_trading=True,
+        risk_multiplier=1.0,
+    )
+    df_bull = pd.DataFrame(
+        {
+            "Open": [100.0] * 10,
+            "High": [101.0, 101.5, 101.8, 101.2, 103.5, 104.0, 104.2, 104.5, 104.8, 105.0],
+            "Low": [99.5, 99.8, 99.7, 100.0, 101.0, 102.0, 102.5, 103.0, 103.5, 104.0],
+            "Close": [100.5, 101.2, 101.5, 101.0, 103.0, 103.8, 104.0, 104.2, 104.5, 104.8],
+            "Volume": [10000] * 10,
+            "session": ["REGULAR"] * 10,
+            "minutes_from_open": [i * 5 for i in range(10)],
+            "vwap": [100.8] * 10,
+            "orb_high": [np.nan, np.nan, np.nan, 101.8, 101.8, 101.8, 101.8, 101.8, 101.8, 101.8],
+            "orb_low": [np.nan, np.nan, np.nan, 99.5, 99.5, 99.5, 99.5, 99.5, 99.5, 99.5],
+            "orb_width": [np.nan, np.nan, np.nan, 2.3, 2.3, 2.3, 2.3, 2.3, 2.3, 2.3],
+            "atr_14": [4.0] * 10,
+            "rvol_at_time": [1.0, 1.0, 1.0, 1.2, 1.9, 2.0, 1.8, 1.5, 1.4, 1.3],
+            "intraday_rs_zscore": [0.5] * 10,
+        },
+        index=pd.date_range("2026-03-10 09:30", periods=10, freq="5min", tz="America/New_York"),
+    )
+    sig = engine.evaluate(df_bull, regime, current_idx=4, ticker="TSLA")
+    assert sig is not None and sig.strategy_name == "ORB_15M_MOMENTUM"
+    print(f"  [OK] IntradaySignalEngine vygeneroval signál: {sig.strategy_name} pro {sig.ticker}")
+
+    bias = scanner.compute_directional_bias(df_bull)
+    assert bias > 0.4
+    print(f"  [OK] OpportunityScanner Directional Bias: {bias:+.2f}")
+
+
 if __name__ == "__main__":
     try:
         test_risk_manager_logic()
+        test_opportunity_scanner_and_intraday_signals()
         test_stock_picker_scoring()
         print("\n==========================================")
         print("  FÁZE 3 ÚSPĚŠNĚ DOKONČENA A OVĚŘENA")

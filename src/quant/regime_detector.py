@@ -29,6 +29,12 @@ class MarketRegimeType(str, Enum):
     BEAR_QUIET = "BEAR_QUIET"          # Klidný pokles / korekce: defenzivní režim, jen selektivní nákupy
     CRISIS_PANIC = "CRISIS_PANIC"      # Panický výprodej / likviditní šok: TVRDÝ NO TRADE / HALT
 
+    # Intradenní sjednocené režimy dle AG-05
+    TRENDING_BULL = "TRENDING_BULL"
+    TRENDING_BEAR = "TRENDING_BEAR"
+    CHOPPY_RANGE = "CHOPPY_RANGE"
+    HIGH_VOL_PANIC = "HIGH_VOL_PANIC"
+
 
 class MarketRegime(BaseModel):
     """Kompletní stav globálního tržního režimu v čase t."""
@@ -57,6 +63,89 @@ class RegimeDetector:
     def __init__(self, panic_vol_percentile_threshold: float = 95.0, panic_drawdown_5d_threshold: float = -5.0):
         self.panic_vol_percentile_threshold = panic_vol_percentile_threshold
         self.panic_drawdown_5d_threshold = panic_drawdown_5d_threshold
+
+    def detect_intraday_regime(
+        self,
+        spy_df: Optional[pd.DataFrame] = None,
+        vix: Optional[float] = None,
+    ) -> MarketRegime:
+        """
+        Vyhodnotí intradenní tržní režim (TRENDING_BULL, TRENDING_BEAR, CHOPPY_RANGE, HIGH_VOL_PANIC).
+        Využívá intradenní odchylku SPY od otevírací ceny/VWAP a volatilitu VIX.
+        """
+        # 1. Krizový filtr volatility (VIX >= 26.0 nebo chybějící data)
+        if vix is not None and vix >= 26.0:
+            return MarketRegime(
+                regime=MarketRegimeType.HIGH_VOL_PANIC,
+                allow_trading=False,
+                risk_multiplier=0.0,
+                momentum_weight=0.0,
+                mean_reversion_weight=0.0,
+                description=f"HIGH_VOL_PANIC: VIX na úrovni {vix:.1f} překračuje panický práh 26.0. Zákaz intradenních nákupů.",
+            )
+
+        if spy_df is None or len(spy_df) < 5:
+            return MarketRegime(
+                regime=MarketRegimeType.CHOPPY_RANGE,
+                allow_trading=True,
+                risk_multiplier=0.5,
+                momentum_weight=0.3,
+                mean_reversion_weight=0.7,
+                description="Nedostatek intradenních dat pro SPY - výchozí neutrální CHOPPY_RANGE.",
+            )
+
+        close = spy_df["Close"]
+        curr_price = float(close.iloc[-1])
+        open_price = float(spy_df["Open"].iloc[0])
+        ret_today_pct = ((curr_price - open_price) / open_price) * 100.0
+
+        # Silný intradenní propad benchmarku (> -1.5 %)
+        if ret_today_pct <= -1.5:
+            return MarketRegime(
+                regime=MarketRegimeType.HIGH_VOL_PANIC,
+                allow_trading=False,
+                risk_multiplier=0.0,
+                momentum_weight=0.0,
+                mean_reversion_weight=0.0,
+                current_price=curr_price,
+                description=f"HIGH_VOL_PANIC: Intradenní propad SPY {ret_today_pct:.2f} % překračuje bezpečnostní limit.",
+            )
+
+        # Sklon krátkodobého trendu (SMA 20 na 5m baru)
+        sma20 = close.rolling(min(20, len(close))).mean()
+        curr_sma = float(sma20.iloc[-1])
+
+        if curr_price > curr_sma and ret_today_pct >= 0.2:
+            return MarketRegime(
+                regime=MarketRegimeType.TRENDING_BULL,
+                allow_trading=True,
+                risk_multiplier=1.0,
+                momentum_weight=0.8,
+                mean_reversion_weight=0.2,
+                current_price=curr_price,
+                description=f"TRENDING_BULL: SPY roste (+{ret_today_pct:.2f} %) nad SMA 20.",
+            )
+        elif curr_price < curr_sma and ret_today_pct <= -0.4:
+            return MarketRegime(
+                regime=MarketRegimeType.TRENDING_BEAR,
+                allow_trading=False,
+                risk_multiplier=0.2,
+                momentum_weight=0.3,
+                mean_reversion_weight=0.7,
+                current_price=curr_price,
+                description=f"TRENDING_BEAR: SPY klesá ({ret_today_pct:.2f} %) pod SMA 20.",
+            )
+        else:
+            return MarketRegime(
+                regime=MarketRegimeType.CHOPPY_RANGE,
+                allow_trading=True,
+                risk_multiplier=0.6,
+                momentum_weight=0.2,
+                mean_reversion_weight=0.8,
+                current_price=curr_price,
+                description=f"CHOPPY_RANGE: Boční pohyb trhu ({ret_today_pct:+.2f} %).",
+            )
+
 
     def detect_regime(
         self,

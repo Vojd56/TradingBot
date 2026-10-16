@@ -12,6 +12,7 @@ from src.execution.portfolio_tracker import PortfolioTracker, PositionRecord
 from src.execution.ticker_mapper import TickerMapper
 from src.llm.sentiment_engine import SentimentEngine
 from src.strategy.autonomous_discovery import AutonomousDiscoveryEngine
+from src.quant.signal_engine import IntradaySignalEngine
 from src.strategy.intraday_data import IntradayDataProvider, IntradaySnapshot
 from src.strategy.macro_regime import MarketRegime, MarketRegimeDetector, RegimeSnapshot
 from src.strategy.market_hours import MarketHours
@@ -180,6 +181,7 @@ class DayTraderEngine:
         # Moduly tržní struktury a sebereflexe chyb (FinMem / Minervini principy)
         self.market_structure = MarketStructureAnalyzer()
         self.reflection_engine = TradeReflectionEngine(sentiment_engine=self.sentiment_engine)
+        self.intraday_signal_engine = IntradaySignalEngine()
         try:
             from pathlib import Path
             self.reflection_engine.bootstrap_from_portfolio_history(Path("data/portfolio_state.json"))
@@ -341,6 +343,43 @@ class DayTraderEngine:
             take_profit_price=tp_price,
             reasons=reasons,
             currency=currency,
+        )
+
+    def evaluate_intraday_dataframe(self, df_5m: Any, ticker: str) -> Optional[DayTradeSignal]:
+        """Vyhodnotí 5m DataFrame pomocí sjednoceného IntradaySignalEngine (ORB, Pullback, Mean Reversion)."""
+        if self.intraday_signal_engine is None or df_5m is None or len(df_5m) < 5:
+            return None
+        from src.quant.regime_detector import MarketRegime as QuantMarketRegime, MarketRegimeType
+        reg_type = MarketRegimeType.TRENDING_BULL
+        if self.current_regime_snapshot:
+            if self.current_regime_snapshot.regime == MarketRegime.RISK_OFF_PANIC:
+                reg_type = MarketRegimeType.HIGH_VOL_PANIC
+            elif self.current_regime_snapshot.regime == MarketRegime.NEUTRAL_CHOPPY:
+                reg_type = MarketRegimeType.CHOPPY_RANGE
+        q_regime = QuantMarketRegime(
+            regime=reg_type,
+            allow_trading=self.current_regime_snapshot.allow_new_buys if self.current_regime_snapshot else True,
+            risk_multiplier=1.0,
+        )
+        sig = self.intraday_signal_engine.evaluate(df_5m, q_regime, ticker=ticker)
+        if sig is None or sig.action != SignalAction.BUY:
+            return None
+        curr = self.get_ticker_currency(ticker)
+        return DayTradeSignal(
+            ticker=ticker,
+            action=SignalAction.BUY,
+            score=85.0,
+            current_price=sig.entry_price,
+            vwap=float(df_5m["vwap"].iloc[-1]) if "vwap" in df_5m.columns else sig.entry_price,
+            ema_9=sig.entry_price,
+            ema_21=sig.entry_price,
+            rsi_5m=50.0,
+            volume_surge=float(df_5m["rvol_at_time"].iloc[-1]) if "rvol_at_time" in df_5m.columns else 1.5,
+            atr_5m=round(abs(sig.entry_price - sig.stop_loss), 2),
+            stop_loss_price=sig.stop_loss,
+            take_profit_price=sig.take_profit,
+            reasons=sig.reasons,
+            currency=curr,
         )
 
     def audit_active_positions(self) -> List[Dict[str, Any]]:

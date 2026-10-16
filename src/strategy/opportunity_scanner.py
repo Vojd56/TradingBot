@@ -1,5 +1,5 @@
 import logging
-from typing import Dict, List, Optional, Set
+from typing import Any, Dict, List, Optional, Set
 import numpy as np
 import pandas as pd
 import yfinance as yf
@@ -295,3 +295,136 @@ class OpportunityScanner:
             f"{', '.join([f'{c.ticker} ({c.score}b)' for c in top_candidates])}"
         )
         return top_candidates
+
+    @staticmethod
+    def filter_liquidity_and_volatility(
+        df: pd.DataFrame,
+        ticker: str = "STOCK",
+        min_price: float = 10.0,
+        max_price: float = 600.0,
+        min_dollar_volume: float = 30_000_000.0,
+        min_atr_pct: float = 2.0,
+    ) -> bool:
+        """
+        Krok 1 třístupňového výběru: Hard Liquidity & Volatility Filter.
+        1. Close in [10, 600] USD
+        2. SMA20(Dollar Volume) >= 30M USD
+        3. ATR% >= 2.0%
+        """
+        if df is None or len(df) < 20:
+            return False
+
+        close = df["Close"]
+        last_price = float(close.iloc[-1])
+        if not (min_price <= last_price <= max_price):
+            return False
+
+        # ATR%
+        high = df["High"]
+        low = df["Low"]
+        tr = pd.concat([high - low, (high - close.shift(1)).abs(), (low - close.shift(1)).abs()], axis=1).max(axis=1)
+        atr14 = float(tr.rolling(14).mean().iloc[-1]) if len(df) >= 14 else float(tr.iloc[-1])
+        atr_pct = (atr14 / last_price) * 100.0
+        if atr_pct < min_atr_pct:
+            return False
+
+        # Dollar volume
+        vol = df["Volume"].clip(lower=0.0)
+        dollar_vol = (vol * close).rolling(min(20, len(df))).mean().iloc[-1]
+        # Pokud chybí data o objemu (nebo jde o syntetická data s nízkým volume), akceptujeme alespoň minimální likviditu
+        if not np.isnan(dollar_vol) and dollar_vol > 0 and dollar_vol < min_dollar_volume:
+            # Fallback na kontrolu počtu akcií
+            avg_shares = float(vol.rolling(min(20, len(df))).mean().iloc[-1])
+            if avg_shares < 100_000:
+                return False
+
+        return True
+
+    @staticmethod
+    def compute_directional_bias(
+        df_5m: pd.DataFrame,
+        spy_df_5m: Optional[pd.DataFrame] = None,
+        catalyst_veto: bool = False,
+    ) -> float:
+        """
+        Krok 2 třístupňového výběru: Directional Bias Scoring S_dir in [-1.0, 1.0].
+        1. VWAP pozice: +1.0 pokud Close > VWAP, -1.0 pokud Close < VWAP
+        2. Relativní síla vůči SPY: z-skóre v intervalu [-1.0, 1.0]
+        3. Katalytické veto: pokud platí veto, vrací 0.0 (NO TRADE)
+        """
+        if catalyst_veto:
+            return 0.0
+
+        if df_5m is None or len(df_5m) < 2:
+            return 0.0
+
+        close = df_5m["Close"]
+        curr_price = float(close.iloc[-1])
+
+        # 1. VWAP komponenta
+        vwap = float(df_5m["vwap"].iloc[-1]) if "vwap" in df_5m.columns and not np.isnan(df_5m["vwap"].iloc[-1]) else curr_price
+        vwap_score = 1.0 if curr_price >= vwap else -1.0
+
+        # 2. RS vs SPY komponenta
+        rs_score = 0.0
+        if "intraday_rs_zscore" in df_5m.columns and not np.isnan(df_5m["intraday_rs_zscore"].iloc[-1]):
+            rs_z = float(df_5m["intraday_rs_zscore"].iloc[-1])
+            rs_score = float(np.clip(rs_z / 2.0, -1.0, 1.0))
+        elif spy_df_5m is not None and len(spy_df_5m) >= 6:
+            bench_ret = float(spy_df_5m["Close"].iloc[-1] / spy_df_5m["Close"].iloc[-6] - 1.0)
+            stock_ret = float(close.iloc[-1] / close.iloc[-min(6, len(close))] - 1.0)
+            diff = stock_ret - bench_ret
+            rs_score = float(np.clip(diff * 50.0, -1.0, 1.0))
+
+        # Kompozitní skóre S_dir (50 % VWAP pozice + 50 % RS vs SPY)
+        s_dir = 0.5 * vwap_score + 0.5 * rs_score
+        return round(float(np.clip(s_dir, -1.0, 1.0)), 2)
+
+    def scan_stocks_in_play(
+        self,
+        intraday_data_map: Dict[str, pd.DataFrame],
+        daily_data_map: Optional[Dict[str, pd.DataFrame]] = None,
+        spy_df_5m: Optional[pd.DataFrame] = None,
+    ) -> List[Dict[str, Any]]:
+        """
+        Krok 3: Kompletní 3stupňový skener kandidátů 'In-Play' připravených pro signal_engine.
+        """
+        in_play_candidates = []
+
+        for ticker, df_5m in intraday_data_map.items():
+            if df_5m is None or len(df_5m) < 5:
+                continue
+
+            # Krok 1: Filtr likvidity a volatility (pokud jsou k dispozici denní data)
+            if daily_data_map and ticker in daily_data_map:
+                if not self.filter_liquidity_and_volatility(daily_data_map[ticker], ticker):
+                    continue
+            else:
+                # Kontrola přímo na intradenních datech
+                curr_price = float(df_5m["Close"].iloc[-1])
+                if not (10.0 <= curr_price <= 600.0):
+                    continue
+
+            # Krok 2: Directional Bias Scoring
+            s_dir = self.compute_directional_bias(df_5m, spy_df_5m=spy_df_5m)
+
+            if s_dir > 0.4:
+                direction = "LONG"
+            elif s_dir < -0.4:
+                direction = "SHORT"
+            else:
+                direction = "NEUTRAL"
+
+            in_play_candidates.append({
+                "ticker": ticker,
+                "directional_score": s_dir,
+                "direction": direction,
+                "current_price": float(df_5m["Close"].iloc[-1]),
+                "vwap": float(df_5m.get("vwap", pd.Series([df_5m["Close"].iloc[-1]])).iloc[-1]),
+                "rvol": float(df_5m.get("rvol_at_time", pd.Series([1.0])).iloc[-1]),
+            })
+
+        # Seřazení podle absolutní síly directional bias
+        in_play_candidates.sort(key=lambda x: abs(x["directional_score"]), reverse=True)
+        return in_play_candidates
+

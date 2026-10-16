@@ -7,7 +7,16 @@ import pandas as pd
 
 from src.quant.features import CausalFeatureEngine, StockFeatures
 from src.quant.regime_detector import MarketRegime, MarketRegimeType, RegimeDetector
-from src.quant.signal_engine import CarverSignalEngine, SignalAction
+from src.quant.signal_engine import (
+    CarverSignalEngine,
+    IntradaySignal,
+    IntradaySignalEngine,
+    ORB15mStrategy,
+    SignalAction,
+    VWAPMeanReversionStrategy,
+    VWAPPullbackStrategy,
+)
+from src.strategy.opportunity_scanner import OpportunityScanner
 
 
 class TestQuantRegimeAndSignals(unittest.TestCase):
@@ -186,6 +195,203 @@ class TestQuantRegimeAndSignals(unittest.TestCase):
         self.assertEqual(signal.action, SignalAction.NO_TRADE)
         self.assertEqual(signal.composite_score, 0.0)
 
+    def test_orb_15m_strategy_breakout(self):
+        """Ověření ORB breakout nákupu se splněním RVOL, VWAP a časového okna."""
+        regime = MarketRegime(
+            regime=MarketRegimeType.TRENDING_BULL,
+            allow_trading=True,
+            risk_multiplier=1.0,
+        )
+        dates = pd.date_range("2026-03-10 09:30", periods=10, freq="5min", tz="America/New_York")
+        df = pd.DataFrame(
+            {
+                "Open": [100.0] * 10,
+                "High": [101.0, 101.5, 101.8, 101.2, 103.5, 104.0, 104.2, 104.5, 104.8, 105.0],
+                "Low": [99.5, 99.8, 99.7, 100.0, 101.0, 102.0, 102.5, 103.0, 103.5, 104.0],
+                "Close": [100.5, 101.2, 101.5, 101.0, 103.0, 103.8, 104.0, 104.2, 104.5, 104.8],
+                "Volume": [10000] * 10,
+                "session": ["REGULAR"] * 10,
+                "minutes_from_open": [i * 5 for i in range(10)],
+                "vwap": [100.8] * 10,
+                "orb_high": [np.nan, np.nan, np.nan, 101.8, 101.8, 101.8, 101.8, 101.8, 101.8, 101.8],
+                "orb_low": [np.nan, np.nan, np.nan, 99.5, 99.5, 99.5, 99.5, 99.5, 99.5, 99.5],
+                "orb_width": [np.nan, np.nan, np.nan, 2.3, 2.3, 2.3, 2.3, 2.3, 2.3, 2.3],
+                "atr_14": [4.0] * 10,
+                "rvol_at_time": [1.0, 1.0, 1.0, 1.2, 1.9, 2.0, 1.8, 1.5, 1.4, 1.3],
+                "intraday_rs_zscore": [0.5] * 10,
+            },
+            index=dates,
+        )
+        strat = ORB15mStrategy()
+        # Bar at idx 4 is at 09:50 (minutes_from_open = 20), Close = 103.0 > orb_high (101.8) and > vwap (100.8), RVOL = 1.9 >= 1.5
+        sig = strat.evaluate_bar(df, regime, idx=4, ticker="TSLA")
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig.action, SignalAction.BUY)
+        self.assertEqual(sig.strategy_name, "ORB_15M_MOMENTUM")
+        self.assertEqual(sig.entry_price, 103.0)
+        self.assertLess(sig.stop_loss, sig.entry_price)
+        self.assertGreater(sig.take_profit, sig.entry_price)
+
+        # Mimo povolené okno (> 90 minut, např. 11:30) musí vrátit None
+        df_late = df.copy()
+        df_late["minutes_from_open"] = 120
+        self.assertIsNone(strat.evaluate_bar(df_late, regime, idx=4, ticker="TSLA"))
+
+    def test_vwap_pullback_strategy(self):
+        """Ověření nákupního signálu při pullbacku a odrazu od VWAP v býčím trendu."""
+        regime = MarketRegime(
+            regime=MarketRegimeType.TRENDING_BULL,
+            allow_trading=True,
+            risk_multiplier=1.0,
+        )
+        dates = pd.date_range("2026-03-10 10:00", periods=10, freq="5min", tz="America/New_York")
+        df = pd.DataFrame(
+            {
+                "Open": [102.0, 101.8, 101.5, 101.2, 100.8, 100.2, 101.0, 101.5, 102.0, 102.2],
+                "High": [102.5, 102.0, 101.8, 101.5, 101.0, 101.2, 101.5, 102.0, 102.5, 102.8],
+                "Low": [101.5, 101.2, 101.0, 100.5, 100.2, 100.1, 100.8, 101.2, 101.5, 101.8],
+                "Close": [101.8, 101.5, 101.2, 100.8, 100.2, 101.0, 101.4, 101.8, 102.2, 102.5],
+                "Volume": [15000] * 10,
+                "minutes_from_open": [30 + i * 5 for i in range(10)],
+                "vwap": [100.0] * 10,
+                "atr_14": [2.0] * 10,
+                "intraday_rs_zscore": [0.8] * 10,
+            },
+            index=dates,
+        )
+        strat = VWAPPullbackStrategy()
+        # Bar at idx=5: minutes_from_open=55, Low=100.1 <= 100.6 (vwap + 0.3*atr), Close=101.0 >= 100.0, Open=100.2
+        sig = strat.evaluate_bar(df, regime, idx=5, ticker="NVDA")
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig.action, SignalAction.BUY)
+        self.assertEqual(sig.strategy_name, "VWAP_TREND_PULLBACK")
+        self.assertEqual(sig.entry_price, 101.0)
+        self.assertLess(sig.stop_loss, 101.0)
+        self.assertGreater(sig.take_profit, 101.0)
+
+    def test_vwap_mean_reversion_strategy(self):
+        """Ověření odrazu z přeprodaného -2 sigma pásma v bočním režimu CHOPPY_RANGE."""
+        regime = MarketRegime(
+            regime=MarketRegimeType.CHOPPY_RANGE,
+            allow_trading=True,
+            risk_multiplier=0.8,
+        )
+        dates = pd.date_range("2026-03-10 11:00", periods=10, freq="5min", tz="America/New_York")
+        df = pd.DataFrame(
+            {
+                "Open": [97.0, 96.5, 96.0, 95.5, 94.2, 94.5, 95.5, 97.0, 98.0, 99.0],
+                "High": [97.5, 97.0, 96.5, 95.8, 94.8, 96.0, 97.2, 98.2, 99.2, 100.2],
+                "Low": [96.5, 96.0, 95.2, 94.0, 93.5, 93.8, 95.0, 96.5, 97.5, 98.5],
+                "Close": [96.8, 96.2, 95.4, 94.2, 94.0, 95.8, 97.0, 98.0, 99.0, 100.0],
+                "Volume": [8000] * 10,
+                "minutes_from_open": [90 + i * 5 for i in range(10)],
+                "vwap": [100.0] * 10,
+                "vwap_lower_2": [94.5] * 10,
+                "atr_14": [2.0] * 10,
+                "rvol_at_time": [1.1] * 10,
+            },
+            index=dates,
+        )
+        strat = VWAPMeanReversionStrategy()
+        # At idx=5: minutes_from_open=115, Low=93.8 <= 94.5, Close=95.8 > Open (94.5), Close < VWAP (100)
+        sig = strat.evaluate_bar(df, regime, idx=5, ticker="AAPL")
+        self.assertIsNotNone(sig)
+        self.assertEqual(sig.action, SignalAction.BUY)
+        self.assertEqual(sig.strategy_name, "VWAP_BAND_REVERSION")
+        self.assertEqual(sig.entry_price, 95.8)
+        self.assertEqual(sig.take_profit, 100.0)
+
+    def test_intraday_signal_engine_integration(self):
+        """Ověření integrace všech strategií v IntradaySignalEngine a generování signálového DF."""
+        engine = IntradaySignalEngine()
+        regime = MarketRegime(
+            regime=MarketRegimeType.TRENDING_BULL,
+            allow_trading=True,
+            risk_multiplier=1.0,
+        )
+        dates = pd.date_range("2026-03-10 09:30", periods=10, freq="5min", tz="America/New_York")
+        df = pd.DataFrame(
+            {
+                "Open": [100.0] * 10,
+                "High": [101.0, 101.5, 101.8, 101.2, 103.5, 104.0, 104.2, 104.5, 104.8, 105.0],
+                "Low": [99.5, 99.8, 99.7, 100.0, 101.0, 102.0, 102.5, 103.0, 103.5, 104.0],
+                "Close": [100.5, 101.2, 101.5, 101.0, 103.0, 103.8, 104.0, 104.2, 104.5, 104.8],
+                "Volume": [10000] * 10,
+                "session": ["REGULAR"] * 10,
+                "minutes_from_open": [i * 5 for i in range(10)],
+                "vwap": [100.8] * 10,
+                "orb_high": [np.nan, np.nan, np.nan, 101.8, 101.8, 101.8, 101.8, 101.8, 101.8, 101.8],
+                "orb_low": [np.nan, np.nan, np.nan, 99.5, 99.5, 99.5, 99.5, 99.5, 99.5, 99.5],
+                "orb_width": [np.nan, np.nan, np.nan, 2.3, 2.3, 2.3, 2.3, 2.3, 2.3, 2.3],
+                "atr_14": [4.0] * 10,
+                "rvol_at_time": [1.0, 1.0, 1.0, 1.2, 1.9, 2.0, 1.8, 1.5, 1.4, 1.3],
+                "intraday_rs_zscore": [0.5] * 10,
+            },
+            index=dates,
+        )
+        sig_df = engine.generate_signals_for_dataframe(df, regime, ticker="TSLA")
+        self.assertEqual(len(sig_df), 10)
+        self.assertIn("signal", sig_df.columns)
+        self.assertIn("stop_loss", sig_df.columns)
+        self.assertIn("take_profit", sig_df.columns)
+        self.assertIn("strategy_name", sig_df.columns)
+        # Bar 4 měl nákupní signál
+        self.assertEqual(sig_df["signal"].iloc[4], 1)
+        self.assertEqual(sig_df["strategy_name"].iloc[4], "ORB_15M_MOMENTUM")
+
+    def test_opportunity_scanner_3step_pipeline(self):
+        """Ověření 3stupňového výběru Stocks-In-Play skeneru."""
+        scanner = OpportunityScanner()
+
+        # 1. Test filtru likvidity a volatility
+        daily_good = pd.DataFrame(
+            {
+                "Close": [150.0] * 25,
+                "Volume": [1_000_000] * 25,
+                "High": [155.0] * 25,
+                "Low": [145.0] * 25,
+            }
+        )
+        self.assertTrue(scanner.filter_liquidity_and_volatility(daily_good, "GOOD_STOCK"))
+
+        # Akcie s příliš nízkou cenou (< 10 USD)
+        daily_cheap = daily_good.copy()
+        daily_cheap["Close"] = 5.0
+        self.assertFalse(scanner.filter_liquidity_and_volatility(daily_cheap, "PENNY_STOCK"))
+
+        # 2. Test Directional Bias
+        df_bull = pd.DataFrame(
+            {
+                "Close": [100.0, 102.0, 104.0, 106.0, 107.0],
+                "vwap": [100.0, 101.0, 102.0, 103.0, 104.0],
+                "intraday_rs_zscore": [0.5, 0.8, 1.2, 1.5, 1.6],
+            }
+        )
+        score_bull = scanner.compute_directional_bias(df_bull)
+        self.assertGreater(score_bull, 0.4)
+
+        df_bear = pd.DataFrame(
+            {
+                "Close": [106.0, 104.0, 102.0, 99.0, 98.0],
+                "vwap": [105.0, 104.0, 103.0, 102.0, 101.0],
+                "intraday_rs_zscore": [-0.5, -0.8, -1.2, -1.5, -1.6],
+            }
+        )
+        score_bear = scanner.compute_directional_bias(df_bear)
+        self.assertLess(score_bear, -0.4)
+
+        # 3. Test kompletního scan_stocks_in_play
+        candidates = scanner.scan_stocks_in_play(
+            intraday_data_map={"BULL": df_bull, "BEAR": df_bear},
+            daily_data_map={"BULL": daily_good, "BEAR": daily_good},
+        )
+        self.assertEqual(len(candidates), 2)
+        self.assertEqual(candidates[0]["ticker"], "BULL")
+        self.assertEqual(candidates[0]["direction"], "LONG")
+        self.assertEqual(candidates[1]["ticker"], "BEAR")
+        self.assertEqual(candidates[1]["direction"], "SHORT")
+
 
 if __name__ == "__main__":
     unittest.main()
+
