@@ -298,21 +298,26 @@ class MultiLLMCommittee:
                 reasoning=f"Katalyzátory a technické momentum potvrzují zájem trhu.",
             )
 
-    def evaluate_consensus(self, stock_data: StockAnalysisData) -> CommitteeConsensus:
+    def evaluate_consensus(
+        self,
+        stock_data: StockAnalysisData,
+        fast_mode: bool = True,
+        timeout: float = 3.0,
+    ) -> CommitteeConsensus:
         """
-        Spustí kompletní zasedání Rady AI modelů pro danou akcii:
-        1. Paralelně nebo sekvenčně získá verdikty od všech 3 analytických person.
-        2. Porovná shodu a identifikuje případné rozpory.
-        3. Aplikuje pravidlo VETA: Pokud skeptik detekuje fatální hrozbu, obchod se zamítne.
-        4. Vypočte finální konsenzus a syntézu pro exekučního tradera.
+        Spustí zasedání Rady AI modelů pro danou akcii:
+        Pokud fast_mode=True (výchozí pro day trading a rychlé skeny):
+        - Používá pevný timeout (výchozí 3s), při výpadku/timeoutu okamžitě
+          využije kvantitativní pravidlové verdikty bez blokování hlavního vlákna.
         """
         ticker = stock_data.ticker
-        logger.info(f"🏛️ [RADA AI ANALYTIKŮ] Zasedání rady pro titul {ticker} ({stock_data.company_name})...")
+        logger.info(f"🏛️ [RADA AI ANALYTIKŮ] Zasedání rady pro titul {ticker} ({stock_data.company_name}, fast_mode={fast_mode})...")
 
-        # 1. Získání verdiktů od jednotlivých agentů
-        v_fund = self._query_agent(LLMAgentRole.FUNDAMENTAL_ANALYST, stock_data)
-        v_audit = self._query_agent(LLMAgentRole.CONTRARIAN_AUDITOR, stock_data)
-        v_cat = self._query_agent(LLMAgentRole.CATALYST_SPECIALIST, stock_data)
+        # 1. Získání verdiktů od jednotlivých agentů (s přísným timeoutem v fast_mode)
+        effective_timeout = min(timeout, 3.0) if fast_mode else timeout
+        v_fund = self._query_agent(LLMAgentRole.FUNDAMENTAL_ANALYST, stock_data, timeout=effective_timeout)
+        v_audit = self._query_agent(LLMAgentRole.CONTRARIAN_AUDITOR, stock_data, timeout=effective_timeout)
+        v_cat = self._query_agent(LLMAgentRole.CATALYST_SPECIALIST, stock_data, timeout=effective_timeout)
 
         verdicts = {
             LLMAgentRole.FUNDAMENTAL_ANALYST.value: v_fund,

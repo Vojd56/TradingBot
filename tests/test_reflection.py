@@ -168,7 +168,68 @@ def test_trade_reflection_engine():
         test_mem_file.unlink()
 
 
+def test_reflection_report_export_and_immutability(tmp_path=None):
+    """Test ověřující export Markdown/JSON reportů a neměnnost produkčních vah (AG-07)."""
+    target_dir = Path(tmp_path) if tmp_path else Path("logs") / "test_reflections"
+    target_dir.mkdir(parents=True, exist_ok=True)
+
+    mem_file = target_dir / "trade_memory.json"
+    engine = TradeReflectionEngine(memory_file=mem_file)
+
+    # 1. Ověření ochranného zámku
+    assert engine.production_weights_immutable is True
+
+    # 2. Vložení zkušební reflexe
+    engine.reflections.append(
+        TradeReflectionRecord(
+            trade_id="TEST_ORCL_1",
+            ticker="ORCL",
+            entry_price=100.0,
+            exit_price=98.5,
+            pnl_pct=-1.5,
+            pnl_eur=-50.0,
+            exit_reason="STOP_LOSS",
+            entry_time=datetime.now().isoformat(),
+            exit_time=datetime.now().isoformat(),
+            duration_minutes=15.0,
+            entry_rsi=72.0,
+            entry_vwap_dist_pct=1.8,
+            entry_volume_surge=2.1,
+            market_regime="BEAR",
+            mistake_category=TradeMistakeCategory.OVERBOUGHT_RSI,
+            lesson_learned="Nákup na vyčerpaném RSI.",
+            prevention_rule={"max_entry_rsi": 66.0},
+            llm_used=False,
+            api_verified=True,
+        )
+    )
+
+    # 3. Export reportu
+    report_file = engine.export_reflection_report(output_dir=target_dir)
+    assert report_file.exists()
+    assert report_file.suffix == ".md"
+
+    # Ověření přítomnosti odpovídajícího JSON reportu
+    json_candidates = list(target_dir.glob("reflection_report_*.json"))
+    assert len(json_candidates) >= 1
+    with open(json_candidates[0], "r", encoding="utf-8") as jf:
+        import json
+        payload = json.load(jf)
+        assert payload["production_weights_immutable"] is True
+        assert len(payload["reflections"]) >= 1
+
+    content = report_file.read_text(encoding="utf-8")
+    assert "ORCL" in content
+    assert "immutable=True" in content
+
+    # Úklid
+    if tmp_path is None:
+        import shutil
+        shutil.rmtree(target_dir, ignore_errors=True)
+
+
 if __name__ == "__main__":
     test_market_structure_analyzer()
     test_trade_reflection_engine()
+    test_reflection_report_export_and_immutability()
     print("\n[OK] Vsechny testy trzni struktury a sebereflexe uspesne prosly!\n")

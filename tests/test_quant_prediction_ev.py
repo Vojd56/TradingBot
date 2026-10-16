@@ -2,9 +2,17 @@
 
 import unittest
 from datetime import datetime
+import numpy as np
+import pandas as pd
 
 from src.quant.features import StockFeatures
-from src.quant.prediction_model import PredictionModel, TripleBarriers
+from src.quant.prediction_model import (
+    MetaLabelingClassifier,
+    PredictionModel,
+    PurgedTimeSeriesSplit,
+    TripleBarriers,
+    create_triple_barrier_labels,
+)
 from src.quant.regime_detector import MarketRegime, MarketRegimeType
 from src.quant.signal_engine import QuantSignal, SignalAction
 
@@ -118,6 +126,119 @@ class TestQuantPredictionEV(unittest.TestCase):
         self.assertEqual(res.decision, SignalAction.NO_TRADE)
         self.assertFalse(res.passes_hurdle)
 
+    def test_create_triple_barrier_labels(self):
+        """Ověření generování Triple-Barrier labelů včetně pesimistické SL kolize."""
+        # Vytvoříme 20 barů
+        df = pd.DataFrame(
+            {
+                "Open": [100.0] * 20,
+                "High": [101.0] * 20,
+                "Low": [99.0] * 20,
+                "Close": [100.0] * 20,
+                "atr_14": [2.0] * 20,
+            }
+        )
+        # Signál na baru 0 (exekuce na baru 1 za Open=100.0)
+        # TP = 100 + 2*2 = 104.0, SL = 100 - 1*2 = 98.0
+        signals = pd.Series(0, index=range(20))
+        signals.iloc[0] = 1
+
+        # Případ A: Bar 3 zasáhne TP (High=105.0)
+        df_tp = df.copy()
+        df_tp.loc[3, "High"] = 105.0
+        labels_tp = create_triple_barrier_labels(df_tp, signals, tp_atr_mult=2.0, sl_atr_mult=1.0, max_bars=10)
+        self.assertEqual(len(labels_tp), 1)
+        self.assertEqual(labels_tp["label"].iloc[0], 1)
+        self.assertEqual(labels_tp["exit_reason"].iloc[0], "TAKE_PROFIT")
+        self.assertEqual(labels_tp["realized_r"].iloc[0], 2.0)
+
+        # Případ B: Bar 3 zasáhne SL (Low=97.0)
+        df_sl = df.copy()
+        df_sl.loc[3, "Low"] = 97.0
+        labels_sl = create_triple_barrier_labels(df_sl, signals, tp_atr_mult=2.0, sl_atr_mult=1.0, max_bars=10)
+        self.assertEqual(labels_sl["label"].iloc[0], 0)
+        self.assertEqual(labels_sl["exit_reason"].iloc[0], "STOP_LOSS")
+        self.assertEqual(labels_sl["realized_r"].iloc[0], -1.0)
+
+        # Případ C: Kolize na baru 3 (Low=97.0 a High=105.0 současně) -> pesimisticky SL
+        df_col = df.copy()
+        df_col.loc[3, "Low"] = 97.0
+        df_col.loc[3, "High"] = 105.0
+        labels_col = create_triple_barrier_labels(df_col, signals, tp_atr_mult=2.0, sl_atr_mult=1.0, max_bars=10)
+        self.assertEqual(labels_col["label"].iloc[0], 0)
+        self.assertEqual(labels_col["exit_reason"].iloc[0], "STOP_LOSS")
+        self.assertEqual(labels_col["realized_r"].iloc[0], -1.0)
+
+    def test_purged_time_series_split(self):
+        """Ověření nulového překryvu, purging obchodů a aplikace embarga."""
+        n_samples = 100
+        X = pd.DataFrame(np.zeros((n_samples, 4)))
+        splitter = PurgedTimeSeriesSplit(n_splits=5, embargo_bars=10)
+
+        # Vytvoříme událost obchodu zasahující z trainu do prvního test splitu (např. split 1: test 20..40)
+        events = pd.DataFrame(
+            [
+                {"entry_idx": 15, "exit_idx": 25},  # Zasahuje do testovacího okna [20..40]
+            ]
+        )
+
+        for train_idx, test_idx in splitter.split(X, events=events):
+            # 1. Striktně disjunktní množiny
+            overlap = set(train_idx).intersection(set(test_idx))
+            self.assertEqual(len(overlap), 0)
+
+            # 2. Embargo kontrola (žádný train index těsně za test_idx v rozmezí embargo_bars)
+            test_max = max(test_idx)
+            embargoed_range = set(range(test_max + 1, min(n_samples, test_max + 1 + 10)))
+            embargo_violation = embargoed_range.intersection(set(train_idx))
+            self.assertEqual(len(embargo_violation), 0)
+
+    def test_meta_labeling_classifier(self):
+        """Ověření fitování regularizovaného meta-modelu a predikce pravděpodobností."""
+        np.random.seed(42)
+        n = 100
+        X = np.random.randn(n, 4)
+        # Lineární target
+        y = (X[:, 0] * 1.5 + X[:, 1] * 0.8 > 0).astype(int)
+
+        clf = MetaLabelingClassifier(l2_reg=0.5, max_iter=150)
+        clf.fit(X, y)
+        self.assertTrue(clf.is_fitted)
+
+        probs = clf.predict_proba(X)
+        self.assertEqual(len(probs), n)
+        self.assertTrue(np.all(probs >= 0.0))
+        self.assertTrue(np.all(probs <= 1.0))
+
+        # Test výpočtu OOS profit factoru
+        realized_r = np.where(y == 1, 2.0, -1.0)
+        pf = clf.evaluate_oos_profit_factor(y, realized_r, probs, threshold=0.5)
+        self.assertGreater(pf, 0.0)
+
+    def test_prediction_model_with_ml_filter(self):
+        """Ověření přepínače use_ml_meta_filter v PredictionModel."""
+        # Natrénujeme meta-model preferující pozitivní příznaky
+        clf = MetaLabelingClassifier()
+        X_mock = np.array([
+            [1.0, 1.2, 0.5, 2.0, 1.5, 0.7],
+            [-1.0, -1.2, -2.0, 4.0, 2.5, -0.5],
+        ])
+        y_mock = np.array([1, 0])
+        clf.fit(X_mock, y_mock)
+
+        # 1. S vypnutým ML filtrem
+        model_rule = PredictionModel(use_ml_meta_filter=False)
+        barriers = model_rule.generate_barriers(self.stock_features, self.bull_regime)
+        p_rule = model_rule.calibrate_win_probability(self.strong_buy_signal, barriers)
+
+        # 2. Se zapnutým ML filtrem
+        model_ml = PredictionModel(use_ml_meta_filter=True, meta_classifier=clf)
+        p_ml = model_ml.calibrate_win_probability(self.strong_buy_signal, barriers)
+
+        self.assertGreaterEqual(p_ml, 0.30)
+        self.assertLessEqual(p_ml, 0.65)
+
 
 if __name__ == "__main__":
     unittest.main()
+

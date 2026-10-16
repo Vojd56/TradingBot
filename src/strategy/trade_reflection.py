@@ -94,6 +94,7 @@ class TradeReflectionEngine:
         self.trade_logs: List[TradeLogEntry] = []
         self.account_metrics: Dict[str, Any] = {}
         self.invalid_unverified_records: List[Dict[str, Any]] = []
+        self.production_weights_immutable: bool = True
         self._load_memory()
 
     def _load_memory(self) -> None:
@@ -289,7 +290,16 @@ class TradeReflectionEngine:
             self._save_memory()
             return rec
 
-        # Pro ztrátové obchody spouštíme AI Post-Mortem na AMD NPU
+        # Pro ztrátové obchody spouštíme AI Post-Mortem na AMD NPU (pokud je server online)
+        if not self.sentiment_engine.is_server_available():
+            rec = self._rule_based_fallback_reflection(
+                ticker, entry_price, exit_price, pnl_pct, pnl_eur, exit_reason,
+                ent_str, ex_str, duration_min, rsi, vwap_dist, vol_surge, regime_name
+            )
+            self.reflections.append(rec)
+            self._save_memory()
+            return rec
+
         prompt = (
             f"Jsi hlavní risk auditor kvantitativního fondu. Zde jsou reálná data uzavřeného ztrátového obchodu:\n"
             f"- Ticker: {ticker}\n"
@@ -664,3 +674,55 @@ class TradeReflectionEngine:
                 )
                 self.reflections.append(ref_rec)
                 existing_ids.add(rec_id)
+
+    def export_reflection_report(self, output_dir: Optional[Path] = None) -> Path:
+        """
+        Vyexportuje strukturovaný report sebereflexe a ponaučení jako Markdown/JSON
+        do složky logs/reflections/ pro kontrolu člověkem.
+        
+        ZÁKAZ AUTOMATICKÉHO PŘEPISOVÁNÍ PRODUKČNÍCH PARAMETRŮ:
+        Strategické limity v produkci zůstávají neměnné bez explicitního lidského schválení.
+        """
+        target_dir = output_dir or (Path("logs") / "reflections")
+        target_dir.mkdir(parents=True, exist_ok=True)
+        date_str = datetime.now().strftime("%Y%m%d_%H%M%S")
+        report_path = target_dir / f"reflection_report_{date_str}.md"
+        json_path = target_dir / f"reflection_report_{date_str}.json"
+
+        # 1. Uložení JSON
+        export_payload = {
+            "exported_at": datetime.now().isoformat(),
+            "production_weights_immutable": self.production_weights_immutable,
+            "account_metrics": self.account_metrics,
+            "total_reflections": len(self.reflections),
+            "reflections": [r.model_dump() for r in self.reflections],
+            "invalid_records": self.invalid_unverified_records,
+        }
+        with open(json_path, "w", encoding="utf-8") as jf:
+            json.dump(export_payload, jf, indent=2, ensure_ascii=False)
+
+        # 2. Uložení Markdown pro lidské schválení
+        lines = [
+            f"# Post-Mortem & Trade Reflection Report ({date_str})",
+            "",
+            "> **Bezpečnostní pojistka:** Produkční parametry a váhy strategií jsou uzamčeny (`immutable=True`).",
+            "> Změny z paměti chyb vyžadují revizi a schválení operátorem.",
+            "",
+            "## 1. Souhrnné účetní metriky z API brokera",
+            f"- **Realizované PnL:** {self.account_metrics.get('realized_pnl', 0.0)} {self.account_metrics.get('currency', 'EUR')}",
+            f"- **Ověřené obchody:** {self.account_metrics.get('total_closed_trades', 0)} (Win Rate: {self.account_metrics.get('win_rate_percent', 0.0)} %)",
+            "",
+            "## 2. Navržená preventivní pravidla k lidskému schválení",
+        ]
+        for r in self.reflections[-10:]:
+            lines.append(f"### Obchod: {r.ticker} ({r.mistake_category.value})")
+            lines.append(f"- **Výsledek:** {r.pnl_pct:+.2f} % ({r.pnl_eur:+.2f} EUR)")
+            lines.append(f"- **Ponaučení:** {r.lesson_learned}")
+            lines.append(f"- **Doporučené pravidlo:** `{json.dumps(r.prevention_rule)}`")
+            lines.append("")
+
+        with open(report_path, "w", encoding="utf-8") as mf:
+            mf.write("\n".join(lines))
+
+        logger.info(f"📄 [REFLEXNÍ REPORT VYGENEROVÁN] Uloženo: {report_path} a {json_path}")
+        return report_path

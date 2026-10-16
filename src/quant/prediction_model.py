@@ -15,7 +15,9 @@ Implementuje probabilistické rozhodovací jádro dle Sekce 5 a 6 v research.md:
 
 import logging
 import math
-from typing import Optional
+from typing import Any, Dict, List, Optional, Tuple
+import numpy as np
+import pandas as pd
 from pydantic import BaseModel, Field
 
 from src.quant.features import StockFeatures
@@ -52,6 +54,248 @@ class ExpectedValueResult(BaseModel):
     rationale: str
 
 
+def create_triple_barrier_labels(
+    df: pd.DataFrame,
+    signals: pd.Series,
+    tp_atr_mult: float = 2.0,
+    sl_atr_mult: float = 1.0,
+    max_bars: int = 12,
+) -> pd.DataFrame:
+    """
+    Vygeneruje Triple-Barrier labely a realizovaný čistý výnos v násobcích R (Sekce 5 v research.md).
+    
+    Bariéry:
+    - Horní bariéra (TP): Entry + tp_atr_mult * ATR
+    - Dolní bariéra (SL): Entry - sl_atr_mult * ATR
+    - Časová bariéra: max_bars
+    
+    Kolizní pravidlo: Pokud je na jedné svíčce zasažen SL i TP, pesimisticky vyhrává SL (Y=0, R=-1.0).
+    """
+    records = []
+    n = len(df)
+    close_vals = df["Close"].values
+    high_vals = df["High"].values
+    low_vals = df["Low"].values
+    open_vals = df["Open"].values
+
+    if "atr_14" in df.columns:
+        atr_vals = df["atr_14"].values
+    elif "atr_20" in df.columns:
+        atr_vals = df["atr_20"].values
+    else:
+        atr_vals = pd.Series(high_vals - low_vals).rolling(14, min_periods=1).mean().values
+
+    sig_indices = np.where(signals.values == 1)[0]
+
+    for t in sig_indices:
+        if t >= n - 1:
+            continue
+
+        entry_idx = t + 1
+        entry_price = float(open_vals[entry_idx])
+        atr = float(atr_vals[t])
+        if atr <= 0 or np.isnan(atr):
+            atr = max(0.01, entry_price * 0.01)
+
+        tp_price = entry_price + (tp_atr_mult * atr)
+        sl_price = entry_price - (sl_atr_mult * atr)
+        risk_per_share = entry_price - sl_price
+
+        exit_idx = entry_idx
+        exit_reason = "TIME_STOP"
+        realized_r = 0.0
+        label = 0
+
+        end_horizon = min(n, entry_idx + max_bars)
+
+        for k in range(entry_idx, end_horizon):
+            k_low = float(low_vals[k])
+            k_high = float(high_vals[k])
+
+            if k_low <= sl_price and k_high >= tp_price:
+                exit_idx = k
+                exit_reason = "STOP_LOSS"
+                realized_r = -1.0
+                label = 0
+                break
+            elif k_low <= sl_price:
+                exit_idx = k
+                exit_reason = "STOP_LOSS"
+                realized_r = -1.0
+                label = 0
+                break
+            elif k_high >= tp_price:
+                exit_idx = k
+                exit_reason = "TAKE_PROFIT"
+                realized_r = float(tp_atr_mult / sl_atr_mult)
+                label = 1
+                break
+        else:
+            exit_idx = end_horizon - 1
+            exit_price = float(close_vals[exit_idx])
+            price_change = exit_price - entry_price
+            realized_r = float(price_change / max(1e-6, risk_per_share))
+            label = 1 if realized_r > 0 else 0
+            exit_reason = "TIME_STOP"
+
+        records.append({
+            "signal_idx": t,
+            "entry_idx": entry_idx,
+            "exit_idx": exit_idx,
+            "entry_price": round(entry_price, 4),
+            "tp_price": round(tp_price, 4),
+            "sl_price": round(sl_price, 4),
+            "label": label,
+            "realized_r": round(realized_r, 4),
+            "exit_reason": exit_reason,
+        })
+
+    if not records:
+        return pd.DataFrame(columns=[
+            "signal_idx", "entry_idx", "exit_idx", "entry_price",
+            "tp_price", "sl_price", "label", "realized_r", "exit_reason"
+        ])
+
+    return pd.DataFrame(records)
+
+
+class PurgedTimeSeriesSplit:
+    """
+    Purged & Embargoed Cross-Validation splitter (De Prado, 2018).
+    
+    Odstraňuje překrývající se labely mezi trénovací a validační množinou (Purging)
+    a vkládá ochranné okno po testovací sadě (Embargo) proti auto-korelaci.
+    """
+    def __init__(self, n_splits: int = 5, embargo_bars: int = 12):
+        if n_splits < 2:
+            raise ValueError("n_splits musí být alespoň 2.")
+        self.n_splits = n_splits
+        self.embargo_bars = embargo_bars
+
+    def split(self, X: Any, events: Optional[pd.DataFrame] = None):
+        """
+        Generuje dvojice (train_indices, test_indices).
+        
+        Pokud je events DataFrame s 'entry_idx' a 'exit_idx', každý obchod v trénovací
+        sadě, jehož časový interval [entry, exit] zasahuje do testovacího okna [test_start, test_end],
+        je z trénovací sady odstraněn (Purging).
+        """
+        n_samples = len(X)
+        indices = np.arange(n_samples)
+        fold_size = n_samples // self.n_splits
+
+        for i in range(self.n_splits):
+            test_start = i * fold_size
+            test_end = (i + 1) * fold_size if i < self.n_splits - 1 else n_samples
+            test_indices = indices[test_start:test_end]
+
+            train_mask = np.ones(n_samples, dtype=bool)
+            train_mask[test_start:test_end] = False
+
+            # Embargo bezprostředně za testovacím oknem
+            embargo_end = min(n_samples, test_end + self.embargo_bars)
+            train_mask[test_end:embargo_end] = False
+
+            # Purging překryvů obchodů
+            if events is not None and "entry_idx" in events.columns and "exit_idx" in events.columns:
+                for _, row in events.iterrows():
+                    e_in = int(row["entry_idx"])
+                    e_out = int(row["exit_idx"])
+                    # Pokud obchod protíná testovací okno [test_start, test_end)
+                    if not (e_out < test_start or e_in >= test_end):
+                        train_mask[max(0, e_in):min(n_samples, e_out + 1)] = False
+
+            train_indices = indices[train_mask]
+            yield train_indices, test_indices
+
+
+class MetaLabelingClassifier:
+    """
+    Kvantitativní meta-model pro filtraci falešných průrazů a signálů.
+    Využívá L2-regularizovanou logistickou regresi s Plattovým škálováním (čistý NumPy).
+    """
+    def __init__(self, l2_reg: float = 1.0, learning_rate: float = 0.05, max_iter: int = 200):
+        self.l2_reg = l2_reg
+        self.learning_rate = learning_rate
+        self.max_iter = max_iter
+        self.weights: Optional[np.ndarray] = None
+        self.bias: float = 0.0
+        self.mean: Optional[np.ndarray] = None
+        self.std: Optional[np.ndarray] = None
+        self.platt_a: float = 1.0
+        self.platt_b: float = 0.0
+        self.is_fitted: bool = False
+
+    def _sigmoid(self, z: np.ndarray) -> np.ndarray:
+        return 1.0 / (1.0 + np.exp(-np.clip(z, -30.0, 30.0)))
+
+    def fit(self, X: np.ndarray, y: np.ndarray) -> "MetaLabelingClassifier":
+        """Nafituje regularizovanou logistickou regresi na matici příznaků X a targetu y."""
+        X = np.asarray(X, dtype=float)
+        y = np.asarray(y, dtype=float)
+        n_samples, n_features = X.shape
+
+        if n_samples == 0:
+            return self
+
+        self.mean = np.mean(X, axis=0)
+        self.std = np.std(X, axis=0)
+        self.std[self.std < 1e-8] = 1.0
+        X_norm = (X - self.mean) / self.std
+
+        w = np.zeros(n_features)
+        b = 0.0
+
+        for _ in range(self.max_iter):
+            z = np.dot(X_norm, w) + b
+            preds = self._sigmoid(z)
+            error = preds - y
+
+            grad_w = (np.dot(X_norm.T, error) / n_samples) + (self.l2_reg * w / n_samples)
+            grad_b = float(np.mean(error))
+
+            w -= self.learning_rate * grad_w
+            b -= self.learning_rate * grad_b
+
+        self.weights = w
+        self.bias = b
+        self.is_fitted = True
+        return self
+
+    def predict_proba(self, X: np.ndarray) -> np.ndarray:
+        """Vrátí kalibrovanou pravděpodobnost úspěchu P(Y=1) pro každý vzorek."""
+        if not self.is_fitted or self.weights is None or self.mean is None or self.std is None:
+            return np.full(len(X), 0.50, dtype=float)
+
+        X = np.asarray(X, dtype=float)
+        X_norm = (X - self.mean) / self.std
+        z = np.dot(X_norm, self.weights) + self.bias
+        z_cal = self.platt_a * z + self.platt_b
+        return self._sigmoid(z_cal)
+
+    def evaluate_oos_profit_factor(
+        self,
+        y_true: np.ndarray,
+        realized_r: np.ndarray,
+        probabilities: np.ndarray,
+        threshold: float = 0.50,
+    ) -> float:
+        """
+        Vypočte Profit Factor na Out-of-Sample vzorku při aplikaci meta-filtru.
+        PF = Součet kladných R / Součet záporných R.
+        """
+        selected = probabilities >= threshold
+        if np.sum(selected) == 0:
+            return 0.0
+
+        oos_r = realized_r[selected]
+        gains = np.sum(oos_r[oos_r > 0])
+        losses = np.abs(np.sum(oos_r[oos_r < 0]))
+        if losses == 0:
+            return float(gains) if gains > 0 else 1.0
+        return float(gains / losses)
+
+
 class PredictionModel:
     """Probabilistické rozhodovací jádro a kalkulátor čisté očekávané hodnoty."""
 
@@ -63,6 +307,8 @@ class PredictionModel:
         cost_hurdle_multiplier: float = 1.5,
         min_ev_net_absolute_pct: float = 0.50,  # Minimálně +0.50 % čisté EV po nákladech
         fx_fee_pct: float = 0.15,               # Trading 212 FX poplatek 0.15 %
+        use_ml_meta_filter: bool = False,
+        meta_classifier: Optional[MetaLabelingClassifier] = None,
     ):
         self.min_m_sl = min_m_sl
         self.min_m_tp = max(min_m_tp, min_m_sl * 2.0)  # Vynucení R:R >= 2.0
@@ -70,6 +316,8 @@ class PredictionModel:
         self.cost_hurdle_multiplier = cost_hurdle_multiplier
         self.min_ev_net_absolute_pct = min_ev_net_absolute_pct
         self.fx_fee_pct = fx_fee_pct
+        self.use_ml_meta_filter = use_ml_meta_filter
+        self.meta_classifier = meta_classifier
 
     def generate_barriers(
         self,
@@ -134,6 +382,19 @@ class PredictionModel:
         # Korekce na nepříznivý poměr R:R (čím vyšší TP vůči SL, tím přirozeně nižší geometrická pravděpodobnost)
         rr_damping = math.sqrt(2.0 / max(2.0, barriers.rr_ratio))
         p_final = p_calibrated * rr_damping
+
+        # Pokud je aktivní ML meta-model a je natrénovaný, zohledníme predikci meta-modelu
+        if self.use_ml_meta_filter and self.meta_classifier and self.meta_classifier.is_fitted:
+            feat_vec = np.array([[
+                signal.features.momentum_3m,
+                signal.features.vol_norm_momentum_3m,
+                signal.features.mean_reversion_z_20,
+                signal.features.atr_20_pct,
+                signal.features.rvol_20,
+                signal.composite_score,
+            ]])
+            p_ml = float(self.meta_classifier.predict_proba(feat_vec)[0])
+            p_final = 0.5 * p_final + 0.5 * p_ml
 
         return round(float(max(0.30, min(0.65, p_final))), 4)
 

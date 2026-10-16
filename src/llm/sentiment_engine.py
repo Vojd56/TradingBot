@@ -1,3 +1,4 @@
+from datetime import datetime
 import json
 import logging
 import re
@@ -8,6 +9,19 @@ from config import settings
 from src.data import StockAnalysisData
 
 logger = logging.getLogger(__name__)
+
+
+class CatalystAssessment(BaseModel):
+    """Strukturovaný datový kontrakt pro pre-market a katalytickou analýzu zpráv."""
+    ticker: str
+    sentiment_score: float = Field(default=0.0, ge=-1.0, le=1.0)
+    has_catalyst: bool = False
+    trade_veto: bool = False  # True při toxických událostech (offering, ředění, buyout cap, SEC fraud)
+    veto_reason: str = ""
+    catalyst_type: str = "NEUTRAL"
+    confidence: float = Field(default=0.5, ge=0.0, le=1.0)
+    summary: str = ""
+    timestamp: datetime = Field(default_factory=datetime.now)
 
 
 class LLMStockVerdict(BaseModel):
@@ -89,6 +103,19 @@ class SentimentEngine:
             base_url=self.base_url,
             api_key=self.api_key,
         )
+
+    def is_server_available(self, timeout: float = 0.2) -> bool:
+        """Rychlý 200ms socket test dostupnosti lokálního LLM serveru bez blokování běhu."""
+        try:
+            import socket
+            import urllib.parse
+            parsed = urllib.parse.urlparse(self.base_url)
+            host = parsed.hostname or "127.0.0.1"
+            port = parsed.port or 8000
+            with socket.create_connection((host, port), timeout=timeout):
+                return True
+        except Exception:
+            return False
 
     def _build_prompt(self, stock_data: StockAnalysisData) -> str:
         m = stock_data.metrics
@@ -351,6 +378,30 @@ Povolené hodnoty pro recommendation jsou výhradně: "BUY", "HOLD", "AVOID". Na
         Zanalyzuje akcii přes Lemonade Server a vrátí validovaný LLMStockVerdict.
         V případě dočasné chyby provede opakovaný pokus.
         """
+        if not self.is_server_available():
+            logger.info(
+                f"Lokální LLM server ({self.base_url}) není dostupný. Používám deterministický fallback pro {stock_data.ticker}."
+            )
+            m = stock_data.metrics
+            rec = "HOLD"
+            score = 0.0
+            if m.trend_bullish and m.rsi_14 < 65:
+                rec = "BUY"
+                score = 0.35
+            elif not m.trend_bullish and m.rsi_14 < 40:
+                rec = "AVOID"
+                score = -0.35
+
+            return LLMStockVerdict(
+                ticker=stock_data.ticker,
+                sentiment_score=score,
+                recommendation=rec,
+                confidence=0.60,
+                key_drivers=[f"Technický trend: {'Býčí' if m.trend_bullish else 'Neutrální/Medvědí'}"],
+                risks=["Deterministický fallback při offline LLM serveru."],
+                reasoning=f"Pravidlový deterministický verdikt pro {stock_data.ticker} (LLM offline).",
+            )
+
         prompt = self._build_prompt(stock_data)
 
         for attempt in range(1, retries + 1):
@@ -419,11 +470,11 @@ Povolené hodnoty pro recommendation jsou výhradně: "BUY", "HOLD", "AVOID". Na
         - Vygeneruje rychlé rozhodnutí: approved (True/False), sentiment (-1.0 až +1.0), důvod.
         - Využívá krátký timeout (default 4 s), aby nikdy nebrzdil intradenní cyklus.
         """
-        if not headlines:
+        if not headlines or not self.is_server_available():
             return {
                 "approved": True,
                 "sentiment": 0.15,
-                "reason": "Žádné bezprostřední negativní zprávy.",
+                "reason": "Žádné bezprostřední negativní zprávy (pravidlový režim).",
                 "llm_used": False,
             }
 
@@ -475,3 +526,115 @@ Povolené hodnoty pro recommendation jsou výhradně: "BUY", "HOLD", "AVOID". Na
             "reason": "Kvantitativní schválení (Lemonade LLM offline nebo časový limit).",
             "llm_used": False,
         }
+
+    def classify_catalyst(
+        self,
+        ticker: str,
+        headlines: List[str],
+        timeout_seconds: float = 3.0,
+    ) -> CatalystAssessment:
+        """
+        Klasifikuje katalyzátor ze zpráv s bleskovou detekcí toxických událostí (VETO).
+        
+        1. Pravidlová detekce toxických klíčových slov (offering, ředění, buyout cap, SEC vyšetřování) -> okamžité VETO.
+        2. Pravidlová detekce silných pozitivních katalyzátorů (earnings beat, contract, FDA approval).
+        3. Volitelné LLM ověření s pevným timeoutem (výchozí 3s), s okamžitým bezpečným fallbackem.
+        """
+        clean_t = ticker.strip().upper()
+        hl_combined = " ".join(headlines).lower()
+
+        # 1. Toxická klíčová slova -> Okamžité VETO
+        toxic_patterns = [
+            (r"\b(public|share|equity|common stock)\s+offering\b", "Sekundární úpis akcií a masivní ředění"),
+            (r"\b(sec|fraud|investigation|subpoena|doj)\b", "Regulatorní nebo trestní vyšetřování (SEC/DOJ)"),
+            (r"\b(bankruptcy|chapter 11|insolvency|delisting)\b", "Hrozba úpadku nebo stažení z burzy"),
+            (r"\b(buyout|tender offer|acquisition at)\b", "Převzetí za fixní cenu omezující upside (Buyout Cap)"),
+        ]
+        for pattern, reason in toxic_patterns:
+            if re.search(pattern, hl_combined):
+                logger.warning(f"🚫 [CATALYST VETO] {clean_t}: {reason}")
+                return CatalystAssessment(
+                    ticker=clean_t,
+                    sentiment_score=-0.80,
+                    has_catalyst=True,
+                    trade_veto=True,
+                    veto_reason=reason,
+                    catalyst_type="TOXIC_EVENT",
+                    confidence=0.90,
+                    summary=f"VETO: {reason}",
+                )
+
+        # 2. Pozitivní katalyzátory
+        positive_patterns = [
+            (r"\b(earnings beat|reports q[1-4]|eps beat|revenue beat)\b", "EARNINGS_BEAT", +0.70, "Pozitivní výsledky hospodaření překonaly očekávání"),
+            (r"\b(contract award|secures deal|partnership with|awarded)\b", "CONTRACT_WIN", +0.65, "Významný kontrakt nebo strategické partnerství"),
+            (r"\b(fda approval|patent granted|clearance)\b", "REGULATORY_APPROVAL", +0.80, "Regulátorní schválení / patent"),
+            (r"\b(upgraded to buy|price target raised)\b", "ANALYST_UPGRADE", +0.50, "Zvýšení cílové ceny / nákupní doporučení analytiků"),
+        ]
+        has_cat = False
+        cat_type = "NEUTRAL"
+        cat_sentiment = 0.0
+        cat_summary = "Běžný tržní šum bez toxických zpráv."
+
+        for pattern, c_type, score, desc in positive_patterns:
+            if re.search(pattern, hl_combined):
+                has_cat = True
+                cat_type = c_type
+                cat_sentiment = score
+                cat_summary = desc
+                break
+
+        # 3. Rychlé volitelné LLM volání pokud jsou k dispozici titulky a LLM server
+        if headlines and self.is_server_available():
+            prompt = (
+                f"Zanalyzuj bleskově zprávy pro {clean_t}:\n"
+                + "\n".join([f"- {h}" for h in headlines[:3]]) + "\n\n"
+                f"Urči: 1. trade_veto (true pokud jde o ředění, úpis nebo fraud, jinak false),\n"
+                f"2. sentiment (-1.0 až +1.0),\n"
+                f"3. catalyst_type (EARNINGS_BEAT, CONTRACT_WIN, DILUTION_OFFERING, TOXIC_EVENT, NEUTRAL),\n"
+                f"4. summary (1 věta v češtině).\n"
+                f"Odpověz VÝHRADNĚ JSON objektem: "
+                f'{{"trade_veto": false, "sentiment": 0.5, "catalyst_type": "CONTRACT_WIN", "summary": "..."}}'
+            )
+            try:
+                response = self.client.chat.completions.create(
+                    model=self.model,
+                    messages=[
+                        {"role": "system", "content": "Jsi kvantitativní risk analytik zpráv. Odpovídáš VÝHRADNĚ platným JSON."},
+                        {"role": "user", "content": prompt},
+                    ],
+                    temperature=0.1,
+                    max_tokens=150,
+                    timeout=timeout_seconds,
+                )
+                raw = response.choices[0].message.content or "{}"
+                m = re.search(r"\{.*?\}", raw, re.DOTALL)
+                if m:
+                    data = json.loads(m.group(0))
+                    v_veto = bool(data.get("trade_veto", False))
+                    v_sent = float(data.get("sentiment", cat_sentiment))
+                    v_type = str(data.get("catalyst_type", cat_type))
+                    v_sum = str(data.get("summary", cat_summary))
+                    return CatalystAssessment(
+                        ticker=clean_t,
+                        sentiment_score=max(-1.0, min(1.0, v_sent)),
+                        has_catalyst=has_cat or abs(v_sent) >= 0.3,
+                        trade_veto=v_veto,
+                        veto_reason=v_sum if v_veto else "",
+                        catalyst_type=v_type,
+                        confidence=0.80,
+                        summary=v_sum,
+                    )
+            except Exception as exc:
+                logger.debug(f"LLM classify_catalyst fallback pro {clean_t}: {exc}")
+
+        return CatalystAssessment(
+            ticker=clean_t,
+            sentiment_score=cat_sentiment,
+            has_catalyst=has_cat,
+            trade_veto=False,
+            veto_reason="",
+            catalyst_type=cat_type,
+            confidence=0.65,
+            summary=cat_summary,
+        )
