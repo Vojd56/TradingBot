@@ -500,14 +500,16 @@ class QuantTraderEngine:
     def start_loop(self, interval_seconds: int = 300) -> None:
         """Spustí nepřetržitou smyčku kvantitativního obchodování."""
         logger.info(f"Spouštím kontinuální kvantitativní smyčku (interval: {interval_seconds} s, dry_run: {self.dry_run})...")
-        while True:
-            try:
-                self.run_cycle()
-            except KeyboardInterrupt:
-                logger.info("Kvantitativní smyčka ukončena uživatelem (Ctrl+C).")
-                break
-            except Exception as e:
-                logger.error(f"Neočekávaná chyba v kvantitativním cyklu: {e}", exc_info=True)
+        print("\nStiskněte Ctrl+C pro bezpečné zastavení kvantitativního tradera.\n")
+        try:
+            while True:
+                try:
+                    self.run_cycle()
+                except Exception as e:
+                    logger.error(f"Neočekávaná chyba v kvantitativním cyklu: {e}", exc_info=True)
 
-            logger.info(f"Čekám {interval_seconds} sekund na další cyklus...")
-            time.sleep(interval_seconds)
+                logger.info(f"Čekám {interval_seconds} sekund na další cyklus...")
+                time.sleep(interval_seconds)
+        except KeyboardInterrupt:
+            logger.info("Kvantitativní smyčka ukončena uživatelem (Ctrl+C).")
+            print("\n🛑 Kvantitativní bot byl bezpečně ukončen uživatelem (Ctrl+C).")
